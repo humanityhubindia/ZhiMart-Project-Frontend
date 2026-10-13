@@ -1,45 +1,23 @@
-# Production stack for one server: Postgres + API + Caddy (HTTPS, serves the SPA, proxies /api).
+# Backend server: API + Caddy (HTTPS in front of the API). The storefront runs on
+# Cloudflare Pages; the database is Neon (DATABASE_URL in backend/.env).
 #
 #   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build
 #
-# deploy/.env    → SITE_DOMAIN, POSTGRES_PASSWORD (used by this file only)
-# backend/.env   → the API's own settings (see backend/.env.example and backend/README.md)
-# frontend/dist  → built SPA (npm run build), served by Caddy
+# deploy/.env    → API_DOMAIN (used by this file only)
+# backend/.env   → the API's own settings incl. DATABASE_URL (see backend/.env.example)
 
 name: zhimart
 
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: zhimart
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
-      POSTGRES_DB: zhimart
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U zhimart -d zhimart"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    networks: [internal]
-    # No ports: the database is reachable only from the api container.
-
   api:
     build: ../backend
     restart: unless-stopped
     env_file: ../backend/.env
     environment:
-      # These override backend/.env so the container always talks to the db service.
-      DATABASE_URL: postgres://zhimart:${POSTGRES_PASSWORD}@db:5432/zhimart
       BIND_ADDR: 0.0.0.0:8080
       APP_ENV: production
       # Only Caddy (fixed address below) may set X-Forwarded-For.
       TRUSTED_PROXIES: 172.28.0.10/32
-    depends_on:
-      db:
-        condition: service_healthy
     networks: [internal]
     # No ports: only Caddy reaches the API.
 
@@ -47,14 +25,13 @@ services:
     image: caddy:2
     restart: unless-stopped
     environment:
-      SITE_DOMAIN: ${SITE_DOMAIN:?set SITE_DOMAIN in deploy/.env}
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in deploy/.env}
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ../frontend/dist:/srv:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on: [api]
@@ -69,6 +46,5 @@ networks:
         - subnet: 172.28.0.0/24
 
 volumes:
-  pgdata:
   caddy_data:
   caddy_config:
