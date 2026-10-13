@@ -1,0 +1,29 @@
+# Backend only, for a server whose own nginx already owns ports 80/443 (other sites on it).
+# nginx terminates HTTPS for api.<domain> and proxies to 127.0.0.1:8090 — see deploy/nginx/.
+#
+#   docker compose -f deploy/docker-compose.host-nginx.yml up -d --build
+#
+# backend/.env → the API's settings incl. DATABASE_URL (Neon).
+
+name: zhimart
+
+services:
+  api:
+    build: ../backend
+    restart: unless-stopped
+    env_file: ../backend/.env
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      APP_ENV: production
+      # Host nginx reaches the container through this network's gateway address.
+      TRUSTED_PROXIES: 172.28.0.1/32
+    ports:
+      # Loopback only: the API is reachable from the internet only through nginx.
+      - "127.0.0.1:8090:8080"
+    networks: [internal]
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
