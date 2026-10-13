@@ -1,0 +1,591 @@
+//! Process configuration, loaded once from the environment and validated at
+//! startup. Anything security-relevant fails closed: a weak secret or an unsafe
+//! production setting aborts boot instead of running degraded.
+
+use std::{env, net::SocketAddr, str::FromStr, time::Duration};
+
+use anyhow::{Context, bail, ensure};
+use axum::http::HeaderValue;
+use ipnetwork::IpNetwork;
+use secrecy::{ExposeSecret, SecretString};
+
+/// Hard ceiling for an admin session. Rotation never extends past this.
+pub const MAX_SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppEnv {
+    Development,
+    Production,
+}
+
+impl AppEnv {
+    pub fn is_production(self) -> bool {
+        matches!(self, AppEnv::Production)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailProvider {
+    /// AWS SES v2. Credentials come from the standard AWS provider chain.
+    Ses,
+    /// Writes the OTP to the server log. Refused when APP_ENV=production.
+    Log,
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub app_env: AppEnv,
+    pub bind_addr: SocketAddr,
+
+    // Database
+    pub database_url: SecretString,
+    pub db_max_connections: u32,
+    pub db_min_connections: u32,
+    pub db_acquire_timeout: Duration,
+
+    // Tokens
+    pub jwt_secret: SecretString,
+    pub jwt_issuer: String,
+    pub jwt_audience: String,
+    pub access_token_ttl: Duration,
+    pub session_ttl: Duration,
+
+    // OTP / login hardening
+    pub otp_pepper: SecretString,
+    pub otp_ttl: Duration,
+    pub otp_max_attempts: i32,
+    pub otp_resend_cooldown: Duration,
+    pub otp_max_resends: i32,
+    pub login_max_failures: i32,
+    pub login_lockout: Duration,
+
+    // Cookies / browser security
+    pub cookie_secure: bool,
+    pub allowed_origins: Vec<HeaderValue>,
+
+    // Network edge
+    pub trusted_proxies: Vec<IpNetwork>,
+    pub rate_limit_global_per_minute: u32,
+    pub rate_limit_auth_per_minute: u32,
+    pub request_timeout: Duration,
+    pub max_body_bytes: usize,
+    pub max_concurrent_requests: usize,
+
+    // Email
+    pub email_provider: EmailProvider,
+    pub ses_from_address: String,
+    pub ses_configuration_set: Option<String>,
+
+    // Payments (Razorpay)
+    /// Master switch for online payments (`RAZORPAY_ENABLED`, default false).
+    /// Off ⇒ checkout places `pay_later` orders straight into `pending_pack`
+    /// (stock deducted, no payment window) and the admin collects payment
+    /// offline; the Razorpay keys are then optional.
+    pub payments_enabled: bool,
+    /// When true every product is charged at [`TEST_MODE_UNIT_PRICE_PAISE`]
+    /// (₹1) per unit, enforced server-side, and orders are flagged `is_test`.
+    pub payment_test_mode: bool,
+    pub razorpay_key_id: String,
+    pub razorpay_key_secret: SecretString,
+    pub razorpay_webhook_secret: SecretString,
+    /// Base URL of the Razorpay REST API (overridable only for tests/mocks).
+    pub razorpay_api_base: String,
+    /// Unpaid orders hold their stock reservation this long, then expire.
+    pub payment_expiry: Duration,
+    /// Merchant name shown in the Razorpay checkout modal.
+    pub store_name: String,
+
+    // Order notifications
+    /// Email the admins about every new order (`ORDER_NOTIFICATION_ENABLED`, default true).
+    pub order_notifications_enabled: bool,
+    /// Explicit recipients (`ORDER_NOTIFICATION_EMAILS`, comma-separated). Empty ⇒
+    /// every active admin's login email.
+    pub order_notification_emails: Vec<String>,
+    /// Public storefront origin (`PUBLIC_SITE_URL`, e.g. `https://zhimart.com`),
+    /// used for the "open in admin console" link in notification emails and the
+    /// customer's tracking link. Required in production when customer emails are on.
+    pub public_site_url: Option<String>,
+    /// Email the customer an order confirmation with their private tracking link
+    /// (`CUSTOMER_ORDER_EMAIL_ENABLED`, default true).
+    pub customer_order_emails_enabled: bool,
+
+    // Pricing tiers
+    /// Two-tier pricing (`BULK_MIN_ORDER_RUPEES`, `STANDARD_DISCOUNT_PERCENT`,
+    /// `BULK_DISCOUNT_PERCENT`).
+    pub pricing: Pricing,
+}
+
+/// Two-tier pricing. An order whose total at price-list prices
+/// (`products.price_paise`) reaches `bulk_min_order_paise` is charged those
+/// prices ("bulk"); a smaller order pays the "standard" price on every line
+/// (MRP less `standard_discount_percent`, see [`crate::money::standard_price_paise`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pricing {
+    /// Minimum order value, at price-list prices, for bulk pricing (paise).
+    pub bulk_min_order_paise: i64,
+    /// Discount off MRP for orders below the bulk minimum (e.g. 70 ⇒ pay 30 % of MRP).
+    pub standard_discount_percent: u32,
+    /// Typical discount of the price list; a label for the storefront only.
+    pub bulk_discount_percent: u32,
+}
+
+impl Default for Pricing {
+    fn default() -> Self {
+        Pricing {
+            bulk_min_order_paise: 10_000 * 100,
+            standard_discount_percent: 70,
+            bulk_discount_percent: 85,
+        }
+    }
+}
+
+impl Pricing {
+    /// Largest accepted `BULK_MIN_ORDER_RUPEES` (₹1 crore).
+    pub const MAX_BULK_MIN_ORDER_RUPEES: i64 = 10_000_000;
+
+    /// Unit price for an order that does not qualify for bulk pricing.
+    pub fn standard_price_paise(&self, price_paise: i64, mrp_paise: i64) -> i64 {
+        crate::money::standard_price_paise(price_paise, mrp_paise, self.standard_discount_percent)
+    }
+
+    /// Whether an order worth `list_total_paise` at price-list prices gets them.
+    pub fn is_bulk(&self, list_total_paise: i64) -> bool {
+        list_total_paise >= self.bulk_min_order_paise
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            (0..=Self::MAX_BULK_MIN_ORDER_RUPEES * 100).contains(&self.bulk_min_order_paise),
+            "BULK_MIN_ORDER_RUPEES must be between 0 and {}",
+            Self::MAX_BULK_MIN_ORDER_RUPEES
+        );
+        ensure!(
+            self.standard_discount_percent <= 99,
+            "STANDARD_DISCOUNT_PERCENT must be between 0 and 99"
+        );
+        ensure!(
+            self.bulk_discount_percent <= 99,
+            "BULK_DISCOUNT_PERCENT must be between 0 and 99"
+        );
+        ensure!(
+            self.standard_discount_percent <= self.bulk_discount_percent,
+            "STANDARD_DISCOUNT_PERCENT must not exceed BULK_DISCOUNT_PERCENT (bulk orders get the bigger discount)"
+        );
+        Ok(())
+    }
+}
+
+/// Storefront origin assumed in development when `PUBLIC_SITE_URL` is unset (Vite dev server).
+const DEV_SITE_URL: &str = "http://localhost:5173";
+
+/// Unit price charged for every product while `PAYMENT_TEST_MODE=true`.
+pub const TEST_MODE_UNIT_PRICE_PAISE: i64 = 100;
+const RAZORPAY_PRODUCTION_API: &str = "https://api.razorpay.com";
+
+impl Config {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let app_env = match var_or("APP_ENV", "production")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "production" | "prod" => AppEnv::Production,
+            "development" | "dev" | "local" => AppEnv::Development,
+            other => bail!("APP_ENV must be 'production' or 'development', got '{other}'"),
+        };
+
+        let email_provider = match var_or("EMAIL_PROVIDER", "ses")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "ses" => EmailProvider::Ses,
+            "log" => EmailProvider::Log,
+            other => bail!("EMAIL_PROVIDER must be 'ses' or 'log', got '{other}'"),
+        };
+
+        let allowed_origins = var_or("ALLOWED_ORIGINS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|o| {
+                ensure!(
+                    o.starts_with("https://") || o.starts_with("http://"),
+                    "ALLOWED_ORIGINS entry '{o}' must include a scheme"
+                );
+                ensure!(
+                    !o.ends_with('/'),
+                    "ALLOWED_ORIGINS entry '{o}' must not end with '/'"
+                );
+                HeaderValue::from_str(o).with_context(|| format!("invalid origin '{o}'"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let trusted_proxies = var_or("TRUSTED_PROXIES", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| {
+                let net = IpNetwork::from_str(p).with_context(|| format!("invalid TRUSTED_PROXIES entry '{p}'"))?;
+                // Trusting a huge range makes X-Forwarded-For spoofable by anyone in it.
+                let min_prefix = if net.is_ipv4() { 8 } else { 32 };
+                ensure!(
+                    net.prefix() >= min_prefix,
+                    "TRUSTED_PROXIES entry '{p}' is too broad (minimum /{min_prefix}); list your proxy/LB ranges only"
+                );
+                Ok(net)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let cfg = Config {
+            app_env,
+            bind_addr: parse_or("BIND_ADDR", "0.0.0.0:8080")?,
+
+            database_url: SecretString::from(required("DATABASE_URL")?),
+            db_max_connections: parse_or("DB_MAX_CONNECTIONS", "20")?,
+            db_min_connections: parse_or("DB_MIN_CONNECTIONS", "2")?,
+            db_acquire_timeout: Duration::from_secs(parse_or("DB_ACQUIRE_TIMEOUT_SECS", "5")?),
+
+            jwt_secret: SecretString::from(required("JWT_SECRET")?),
+            jwt_issuer: var_or("JWT_ISSUER", "zhimart-api"),
+            jwt_audience: var_or("JWT_AUDIENCE", "zhimart-admin"),
+            access_token_ttl: Duration::from_secs(parse_or("ACCESS_TOKEN_TTL_SECS", "900")?),
+            session_ttl: Duration::from_secs(parse_or("SESSION_TTL_SECS", "2592000")?),
+
+            otp_pepper: SecretString::from(required("OTP_PEPPER")?),
+            otp_ttl: Duration::from_secs(parse_or("OTP_TTL_SECS", "300")?),
+            otp_max_attempts: parse_or("OTP_MAX_ATTEMPTS", "5")?,
+            otp_resend_cooldown: Duration::from_secs(parse_or("OTP_RESEND_COOLDOWN_SECS", "60")?),
+            otp_max_resends: parse_or("OTP_MAX_RESENDS", "3")?,
+            login_max_failures: parse_or("LOGIN_MAX_FAILURES", "5")?,
+            login_lockout: Duration::from_secs(parse_or("LOGIN_LOCKOUT_SECS", "900")?),
+
+            cookie_secure: parse_or("COOKIE_SECURE", "true")?,
+            allowed_origins,
+
+            trusted_proxies,
+            rate_limit_global_per_minute: parse_or("RATE_LIMIT_GLOBAL_PER_MINUTE", "300")?,
+            rate_limit_auth_per_minute: parse_or("RATE_LIMIT_AUTH_PER_MINUTE", "10")?,
+            request_timeout: Duration::from_secs(parse_or("REQUEST_TIMEOUT_SECS", "15")?),
+            max_body_bytes: parse_or("MAX_BODY_BYTES", "65536")?,
+            max_concurrent_requests: parse_or("MAX_CONCURRENT_REQUESTS", "1024")?,
+
+            email_provider,
+            ses_from_address: var_or("SES_FROM_ADDRESS", ""),
+            ses_configuration_set: env::var("SES_CONFIGURATION_SET")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+
+            payments_enabled: parse_or("RAZORPAY_ENABLED", "false")?,
+            payment_test_mode: parse_or("PAYMENT_TEST_MODE", "false")?,
+            razorpay_key_id: var_or("RAZORPAY_KEY_ID", "").trim().to_owned(),
+            razorpay_key_secret: SecretString::from(var_or("RAZORPAY_KEY_SECRET", "")),
+            razorpay_webhook_secret: SecretString::from(var_or("RAZORPAY_WEBHOOK_SECRET", "")),
+            razorpay_api_base: var_or("RAZORPAY_API_BASE", RAZORPAY_PRODUCTION_API)
+                .trim_end_matches('/')
+                .to_owned(),
+            payment_expiry: Duration::from_secs(
+                60 * parse_or::<u64>("PAYMENT_EXPIRY_MINUTES", "30")?,
+            ),
+            store_name: var_or("STORE_NAME", "Zhi-Mart Fireworks"),
+
+            order_notifications_enabled: parse_or("ORDER_NOTIFICATION_ENABLED", "true")?,
+            order_notification_emails: var_or("ORDER_NOTIFICATION_EMAILS", "")
+                .split(',')
+                .map(|e| e.trim().to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect(),
+            public_site_url: env::var("PUBLIC_SITE_URL")
+                .ok()
+                .map(|u| u.trim().trim_end_matches('/').to_owned())
+                .filter(|u| !u.is_empty()),
+            customer_order_emails_enabled: parse_or("CUSTOMER_ORDER_EMAIL_ENABLED", "true")?,
+
+            pricing: Pricing {
+                bulk_min_order_paise: parse_or::<i64>("BULK_MIN_ORDER_RUPEES", "10000")?
+                    .checked_mul(100)
+                    .context("BULK_MIN_ORDER_RUPEES is out of range")?,
+                standard_discount_percent: parse_or("STANDARD_DISCOUNT_PERCENT", "70")?,
+                bulk_discount_percent: parse_or("BULK_DISCOUNT_PERCENT", "85")?,
+            },
+        };
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.jwt_secret.expose_secret().len() >= 32,
+            "JWT_SECRET must be at least 32 bytes (generate with: openssl rand -base64 48)"
+        );
+        ensure!(
+            self.otp_pepper.expose_secret().len() >= 32,
+            "OTP_PEPPER must be at least 32 bytes (generate with: openssl rand -base64 48)"
+        );
+        ensure!(
+            self.jwt_secret.expose_secret() != self.otp_pepper.expose_secret(),
+            "JWT_SECRET and OTP_PEPPER must be different secrets"
+        );
+        ensure!(
+            (60..=3600).contains(&self.access_token_ttl.as_secs()),
+            "ACCESS_TOKEN_TTL_SECS must be between 60 and 3600"
+        );
+        ensure!(
+            self.session_ttl > self.access_token_ttl && self.session_ttl <= MAX_SESSION_TTL,
+            "SESSION_TTL_SECS must be greater than the access token TTL and at most 30 days"
+        );
+        ensure!(
+            (60..=900).contains(&self.otp_ttl.as_secs()),
+            "OTP_TTL_SECS must be between 60 and 900"
+        );
+        ensure!(
+            (1..=10).contains(&self.otp_max_attempts),
+            "OTP_MAX_ATTEMPTS must be between 1 and 10"
+        );
+        ensure!(
+            (0..=10).contains(&self.otp_max_resends),
+            "OTP_MAX_RESENDS must be between 0 and 10"
+        );
+        ensure!(
+            (1..=20).contains(&self.login_max_failures),
+            "LOGIN_MAX_FAILURES must be between 1 and 20"
+        );
+        ensure!(
+            self.db_min_connections <= self.db_max_connections,
+            "DB_MIN_CONNECTIONS > DB_MAX_CONNECTIONS"
+        );
+        ensure!(
+            self.rate_limit_auth_per_minute > 0,
+            "RATE_LIMIT_AUTH_PER_MINUTE must be > 0"
+        );
+        ensure!(
+            self.rate_limit_global_per_minute > 0,
+            "RATE_LIMIT_GLOBAL_PER_MINUTE must be > 0"
+        );
+        ensure!(
+            self.max_body_bytes >= 1024,
+            "MAX_BODY_BYTES must be at least 1024"
+        );
+        ensure!(
+            self.max_concurrent_requests > 0,
+            "MAX_CONCURRENT_REQUESTS must be > 0"
+        );
+        self.pricing.validate()?;
+
+        if self.email_provider == EmailProvider::Ses {
+            ensure!(
+                self.ses_from_address.contains('@'),
+                "SES_FROM_ADDRESS must be set to a verified SES identity when EMAIL_PROVIDER=ses"
+            );
+        }
+
+        if self.payments_enabled {
+            ensure!(
+                self.razorpay_key_id.starts_with("rzp_test_")
+                    || self.razorpay_key_id.starts_with("rzp_live_"),
+                "RAZORPAY_ENABLED=true requires RAZORPAY_KEY_ID (rzp_test_... or rzp_live_...)"
+            );
+            ensure!(
+                self.razorpay_key_secret.expose_secret().len() >= 16,
+                "RAZORPAY_ENABLED=true requires RAZORPAY_KEY_SECRET"
+            );
+            ensure!(
+                self.razorpay_webhook_secret.expose_secret().len() >= 16,
+                "RAZORPAY_ENABLED=true requires RAZORPAY_WEBHOOK_SECRET (min 16 chars; same value as the Razorpay dashboard webhook)"
+            );
+            ensure!(
+                self.razorpay_webhook_secret.expose_secret()
+                    != self.razorpay_key_secret.expose_secret(),
+                "RAZORPAY_WEBHOOK_SECRET must differ from RAZORPAY_KEY_SECRET"
+            );
+        }
+        for e in &self.order_notification_emails {
+            ensure!(
+                e.len() <= 254
+                    && e.contains('@')
+                    && !e.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "ORDER_NOTIFICATION_EMAILS contains an invalid address '{e}'"
+            );
+        }
+        ensure!(
+            self.order_notification_emails.len() <= 20,
+            "ORDER_NOTIFICATION_EMAILS: at most 20 recipients"
+        );
+        if let Some(url) = &self.public_site_url {
+            ensure!(
+                url.starts_with("https://")
+                    || (!self.app_env.is_production() && url.starts_with("http://")),
+                "PUBLIC_SITE_URL must be an https:// URL"
+            );
+        }
+        ensure!(
+            (10..=1440).contains(&(self.payment_expiry.as_secs() / 60)),
+            "PAYMENT_EXPIRY_MINUTES must be between 10 and 1440"
+        );
+        ensure!(
+            !self.store_name.trim().is_empty() && self.store_name.len() <= 80,
+            "STORE_NAME must be 1-80 characters"
+        );
+        ensure!(
+            self.razorpay_api_base.starts_with("https://") || !self.app_env.is_production(),
+            "RAZORPAY_API_BASE must be https"
+        );
+
+        if self.app_env.is_production() {
+            ensure!(
+                !self.customer_order_emails_enabled || self.public_site_url.is_some(),
+                "PUBLIC_SITE_URL must be set in production when CUSTOMER_ORDER_EMAIL_ENABLED=true (it builds the customer's tracking link)"
+            );
+            ensure!(
+                self.razorpay_api_base == RAZORPAY_PRODUCTION_API,
+                "RAZORPAY_API_BASE cannot be overridden in production"
+            );
+            ensure!(
+                !self.payments_enabled
+                    || self.payment_test_mode
+                    || self.razorpay_key_id.starts_with("rzp_live_"),
+                "APP_ENV=production with RAZORPAY_ENABLED=true and PAYMENT_TEST_MODE=false requires live Razorpay keys (rzp_live_...)"
+            );
+            ensure!(
+                self.cookie_secure,
+                "COOKIE_SECURE must be true in production"
+            );
+            ensure!(
+                self.email_provider == EmailProvider::Ses,
+                "EMAIL_PROVIDER=log is not allowed in production"
+            );
+            ensure!(
+                !self.allowed_origins.is_empty(),
+                "ALLOWED_ORIGINS must be set in production"
+            );
+            ensure!(
+                self.allowed_origins
+                    .iter()
+                    .all(|o| o.as_bytes().starts_with(b"https://")),
+                "ALLOWED_ORIGINS must all be https:// in production"
+            );
+        }
+        Ok(())
+    }
+
+    /// Name of the refresh-token cookie. The `__Secure-` prefix makes browsers
+    /// refuse the cookie unless it was set over HTTPS with the Secure flag.
+    pub fn refresh_cookie_name(&self) -> &'static str {
+        if self.cookie_secure {
+            "__Secure-zm_rt"
+        } else {
+            "zm_rt"
+        }
+    }
+
+    /// Origin used to build links in emails: `PUBLIC_SITE_URL`, or the Vite dev
+    /// server in development. (Production always has `PUBLIC_SITE_URL` when it matters — validated.)
+    pub fn site_url(&self) -> &str {
+        self.public_site_url.as_deref().unwrap_or(DEV_SITE_URL)
+    }
+
+    /// Customer tracking page for an order. The token sits in the URL *fragment*,
+    /// so it is never sent to any server or leaked via `Referer`.
+    pub fn order_tracking_url(&self, order_number: &str, order_token: &str) -> String {
+        format!(
+            "{}/?page=order&order={order_number}#t={order_token}",
+            self.site_url()
+        )
+    }
+
+    /// `true` when the configured Razorpay keys are test-mode keys (no real money moves).
+    pub fn razorpay_is_test_key(&self) -> bool {
+        self.razorpay_key_id.starts_with("rzp_test_")
+    }
+
+    pub fn is_allowed_origin(&self, origin: &[u8]) -> bool {
+        self.allowed_origins.iter().any(|o| o.as_bytes() == origin)
+    }
+}
+
+fn required(key: &str) -> anyhow::Result<String> {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => Ok(v),
+        _ => bail!("missing required environment variable {key}"),
+    }
+}
+
+fn var_or(key: &str, default: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn parse_or<T>(key: &str, default: &str) -> anyhow::Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = var_or(key, default);
+    raw.trim()
+        .parse::<T>()
+        .map_err(|e| anyhow::anyhow!("invalid value for {key}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pricing;
+
+    #[test]
+    fn pricing_defaults_and_tier() {
+        let p = Pricing::default();
+        assert!(p.validate().is_ok());
+        assert_eq!(p.bulk_min_order_paise, 1_000_000);
+        assert!(p.is_bulk(1_000_000), "exactly ₹10,000 is bulk");
+        assert!(!p.is_bulk(999_999));
+        assert_eq!(p.standard_price_paise(3_200, 21_000), 6_300);
+    }
+
+    #[test]
+    fn pricing_validation() {
+        let ok = Pricing::default();
+        let bad = [
+            Pricing {
+                bulk_min_order_paise: -100,
+                ..ok
+            },
+            Pricing {
+                bulk_min_order_paise: (Pricing::MAX_BULK_MIN_ORDER_RUPEES + 1) * 100,
+                ..ok
+            },
+            Pricing {
+                standard_discount_percent: 100,
+                bulk_discount_percent: 100,
+                ..ok
+            },
+            Pricing {
+                bulk_discount_percent: 100,
+                ..ok
+            },
+            Pricing {
+                standard_discount_percent: 90,
+                ..ok
+            },
+        ];
+        for p in bad {
+            assert!(p.validate().is_err(), "{p:?}");
+        }
+        assert!(
+            Pricing {
+                bulk_min_order_paise: 0,
+                ..ok
+            }
+            .validate()
+            .is_ok(),
+            "0 = always bulk"
+        );
+    }
+}
+
+/// Shared `Config` fixture for unit tests across modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn config() -> super::Config {
+        crate::auth::jwt::tests::test_config()
+    }
+}

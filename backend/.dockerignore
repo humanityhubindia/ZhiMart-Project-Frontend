@@ -1,0 +1,22 @@
+# Build output
+target/
+
+# Secrets and local environment (never send them to the Docker daemon)
+.env
+.env.*
+!.env.example
+
+# VCS / editor / OS noise
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Not needed to build the image
+tests/
+docker-compose.yml
+Dockerfile
+.dockerignore
+*.md

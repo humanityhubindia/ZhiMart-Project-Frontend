@@ -24,3 +24,16 @@ dist-ssr
 *.sw?
 
 tsconfig.tsbuildinfo
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Rust
+backend/target
+
+# Large Assets / Unneeded root files
+crackerspic/
+*.docx
+*.sql

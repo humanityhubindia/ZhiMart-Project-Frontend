@@ -1,0 +1,42 @@
+# LOCAL DEVELOPMENT ONLY. Not a production deployment.
+#
+#   docker compose up -d db                 # Postgres on 127.0.0.1:5433
+#   docker compose --profile api up --build # also run the API in a container
+
+name: zhimart
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zhimart
+      POSTGRES_PASSWORD: zhimart # dev-only credential
+      POSTGRES_DB: zhimart
+    ports:
+      # Loopback only: never expose the dev database on your LAN.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zhimart -d zhimart"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    profiles: ["api"]
+    build: .
+    env_file: .env
+    environment:
+      # Inside the compose network the database is "db:5432", not the host port.
+      DATABASE_URL: postgres://zhimart:zhimart@db:5432/zhimart
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
