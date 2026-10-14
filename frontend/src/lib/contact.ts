@@ -12,3 +12,11 @@ export const SUPPORT_PHONE_TEL = `+${BUSINESS_WHATSAPP_NUMBER}`;
 export function supportWhatsAppUrl(message: string): string {
   return `https://wa.me/${BUSINESS_WHATSAPP_NUMBER}?text=${encodeURIComponent(message)}`;
 }
+
+/** Shop address, shown in the footer and printed on receipts/invoices. */
+export const BUSINESS_ADDRESS_LINES = [
+  '273, Kamarajar Road,',
+  'Opp. to Gandhi Memorial School, Lions Bus Stop,',
+  'Uppilipalayam, Coimbatore - 641015',
+] as const;
+export const BUSINESS_ADDRESS = BUSINESS_ADDRESS_LINES.join(' ');
