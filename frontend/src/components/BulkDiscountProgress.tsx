@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowRight, BadgePercent, PartyPopper, Sparkles } from 'lucide-react';
+import { ArrowRight, BadgePercent, PartyPopper } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { CartTotals, formatRupees, hasBulkThreshold } from '../lib/money';
 import { useTestMode } from '../hooks/useProducts';
@@ -134,7 +134,7 @@ export const BulkDiscountProgress: React.FC<BulkDiscountProgressProps> = ({
       )}
     >
       <div role="status" aria-live="polite" className="flex items-start gap-2">
-        <Sparkles
+        <BadgePercent
           className={cn('text-orange-500 shrink-0', compact ? 'w-4 h-4' : 'w-5 h-5')}
           aria-hidden="true"
         />
