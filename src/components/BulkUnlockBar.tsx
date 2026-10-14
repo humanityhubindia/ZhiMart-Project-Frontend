@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { ChevronRight, PartyPopper, Sparkles, X } from 'lucide-react';
+import { BadgePercent, ChevronRight, PartyPopper, X } from 'lucide-react';
 import { CartTotals, formatRupees, hasBulkThreshold } from '../lib/money';
 import { useTestMode } from '../hooks/useProducts';
 
@@ -112,7 +112,7 @@ export const BulkUnlockBar: React.FC<BulkUnlockBarProps> = ({ totals, onOpenCart
                     aria-label={`Add ₹${formatRupees(totals.amountToUnlock)} more to unlock ${rules.bulkDiscountPercent}% OFF. Open cart.`}
                   >
                     <span className="flex items-center gap-2 text-xs font-extrabold leading-tight">
-                      <Sparkles className="w-4 h-4 shrink-0 text-amber-400" aria-hidden="true" />
+                      <BadgePercent className="w-4 h-4 shrink-0 text-amber-400" aria-hidden="true" />
                       <span role="status" aria-live="polite" className="truncate">
                         ₹{formatRupees(totals.amountToUnlock)} more for{' '}
                         <span className="text-amber-400">{rules.bulkDiscountPercent}% OFF</span>

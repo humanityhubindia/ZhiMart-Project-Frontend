@@ -83,14 +83,19 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-12 gap-8 lg:gap-12 items-center">
           {/* Left Column (7 cols): Editorial Copy & Primary Actions */}
           <div className="md:col-span-7 space-y-6">
-            {/* Top Unified Pill Tag */}
-            <div className="inline-flex items-center gap-2 bg-slate-950 text-white px-3.5 py-1.5 sm:px-4 sm:py-2 rounded-full text-xs font-bold shadow-xs border border-slate-800">
-              <span className="text-slate-200">Direct From Sivakasi, Tamil Nadu</span>
-              <span className="text-slate-600">&bull;</span>
-              <span className="text-amber-400 font-extrabold flex items-center gap-1.5">
-                <Truck className="w-3.5 h-3.5 text-amber-400 shrink-0 inline" />
-                Free Delivery
-              </span>
+            {/* Top Festive Badge & Unified Pill */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="inline-flex items-center bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-white px-3.5 py-1.5 rounded-full text-xs font-black shadow-xs tracking-wide">
+                <span>Diwali Special Discount &bull; Up to 85% OFF</span>
+              </div>
+              <div className="inline-flex items-center gap-2 bg-slate-950 text-white px-3.5 py-1.5 sm:px-4 sm:py-1.5 rounded-full text-xs font-bold shadow-xs border border-slate-800">
+                <span className="text-slate-200">Direct From Sivakasi, Tamil Nadu</span>
+                <span className="text-slate-600">&bull;</span>
+                <span className="text-amber-400 font-extrabold flex items-center gap-1.5">
+                  <Truck className="w-3.5 h-3.5 text-amber-400 shrink-0 inline" />
+                  Free Delivery
+                </span>
+              </div>
             </div>
 
             {/* Main Headline */}
@@ -105,7 +110,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
             {/* Sub-headline */}
             <p className="text-sm sm:text-base lg:text-lg text-slate-600 font-medium leading-relaxed max-w-2xl">
               Order fresh 2026 factory fireworks dispatched straight from certified manufacturing units in Sivakasi.
-              Zero retail markups, zero middleman margins — enjoy <strong className="text-slate-900 font-extrabold">100% Free Insured Delivery</strong> and a <strong className="text-slate-900 font-extrabold">Flat 75% Factory Wholesale Discount</strong>.
+              Zero retail markups, zero middleman margins — enjoy <strong className="text-slate-900 font-extrabold">100% Free Insured Delivery</strong> and our <strong className="text-slate-900 font-extrabold">Diwali Special Discount of Up to 85% Factory Wholesale Rates</strong>.
             </p>
 
             {/* Quick Action Buttons */}
@@ -261,10 +266,10 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               <Percent className="w-5 h-5 text-blue-600" />
             </div>
             <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              Flat 75% Factory Rates
+              Up to 85% Diwali Discount
             </h3>
             <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Wholesale factory rate cards applied automatically. Save far more than at local retail fireworks stalls.
+              Wholesale factory rate cards applied automatically. Save up to 85% compared to local retail fireworks stalls.
             </p>
           </div>
 

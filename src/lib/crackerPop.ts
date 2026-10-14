@@ -260,16 +260,16 @@ class FireworksEngine {
   private explode(b: BurstSpec) {
     const budget = this.budgetLeft;
     if (budget <= 0) return;
-    const sizeK = Math.min(1.25, Math.max(0.6, Math.min(this.w, this.h) / 700));
+    const sizeK = Math.min(1.35, Math.max(0.7, Math.min(this.w, this.h) / 650));
     const willow = b.kind === 'willow';
-    const count = Math.min(budget, Math.round((willow ? 55 : 70) * b.scale * deviceScale(this.w)));
-    const maxSpeed = (willow ? 190 : 290) * b.scale * sizeK;
-    const baseLife = this.opts.sparkLife * (willow ? 1.6 : 1);
+    const count = Math.min(budget, Math.round((willow ? 95 : 120) * b.scale * deviceScale(this.w)));
+    const maxSpeed = (willow ? 260 : 380) * b.scale * sizeK;
+    const baseLife = this.opts.sparkLife * (willow ? 1.6 : 1.05);
 
     for (let i = 0; i < count; i++) {
       const angle = (i / count) * Math.PI * 2 + rand(-0.08, 0.08);
       const speed =
-        b.kind === 'ring' ? maxSpeed * rand(0.92, 1) : maxSpeed * (0.25 + 0.75 * Math.sqrt(Math.random()));
+        b.kind === 'ring' ? maxSpeed * rand(0.92, 1) : maxSpeed * (0.22 + 0.78 * Math.sqrt(Math.random()));
       const s = this.pool.pop() ?? ({} as Spark);
       s.x = s.px = b.x;
       s.y = s.py = b.y;
@@ -277,12 +277,12 @@ class FireworksEngine {
       s.vy = Math.sin(angle) * speed;
       s.maxLife = s.life = baseLife * rand(0.75, 1.15);
       s.color = willow ? 0 : b.colors[i % b.colors.length];
-      s.glitter = Math.random() < (willow ? 0.35 : 0.15);
-      s.drag = willow ? 0.94 : 0.962;
-      s.gravity = willow ? 190 : 120;
+      s.glitter = Math.random() < (willow ? 0.38 : 0.18);
+      s.drag = willow ? 0.942 : 0.965;
+      s.gravity = willow ? 180 : 115;
       this.sparks.push(s);
     }
-    this.flashes.push({ x: b.x, y: b.y, r: maxSpeed * 0.35, life: 0.18, maxLife: 0.18 });
+    this.flashes.push({ x: b.x, y: b.y, r: maxSpeed * 0.45, life: 0.22, maxLife: 0.22 });
   }
 
   private update(dt: number) {
@@ -358,12 +358,12 @@ class FireworksEngine {
     // Rockets: bright gold head with a short streak.
     ctx.lineCap = 'round';
     if (this.rockets.length) {
-      ctx.strokeStyle = '#FFC94D';
-      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = '#FFD066';
+      ctx.lineWidth = 2.8;
       ctx.beginPath();
       for (const r of this.rockets) {
         if (r.age < 0.04) continue; // let mid-air launches appear without a pop-in dot
-        ctx.moveTo(r.px, r.py + 6);
+        ctx.moveTo(r.px, r.py + 8);
         ctx.lineTo(r.x, r.y);
       }
       ctx.globalAlpha = opacity;
@@ -384,7 +384,7 @@ class FireworksEngine {
       this.buckets[s.color * ALPHA_LEVELS + level].push(s);
     }
 
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.4;
     for (let c = 0; c < PALETTE.length; c++) {
       ctx.strokeStyle = PALETTE[c];
       for (let a = 0; a < ALPHA_LEVELS; a++) {
@@ -404,7 +404,7 @@ class FireworksEngine {
       ctx.fillStyle = GLITTER_COLOR;
       ctx.globalAlpha = 0.95 * opacity;
       for (const s of glitter) {
-        const size = 1.2 + Math.random() * 1.6;
+        const size = 1.4 + Math.random() * 2.2;
         ctx.fillRect(s.x - size / 2, s.y - size / 2, size, size);
       }
     }
@@ -462,10 +462,10 @@ function createOverlay(): Overlay {
   };
 
   const engine = new FireworksEngine(canvas, {
-    maxSparks: Math.round(700 * deviceScale(window.innerWidth)),
+    maxSparks: Math.round(1400 * deviceScale(window.innerWidth)),
     maxDpr: 2,
     opacity: 1,
-    sparkLife: 1.1,
+    sparkLife: 1.25,
     onIdle: () => teardown(),
   });
 
@@ -485,20 +485,20 @@ function createOverlay(): Overlay {
 function planShow(engine: FireworksEngine, intensity: 'light' | 'celebration', durationMs: number) {
   const { width: w, height: h } = engine;
   if (intensity === 'light') {
-    const n = 1 + Math.floor(Math.random() * 3);
+    const n = 2 + Math.floor(Math.random() * 3);
     const window_ = Math.max(0, durationMs - 1250);
     for (let i = 0; i < n; i++) {
-      const x = w * rand(0.2, 0.8);
-      const y = h * rand(0.18, 0.42);
+      const x = w * rand(0.15, 0.85);
+      const y = h * rand(0.12, 0.42);
       const delay = n === 1 ? 0 : (window_ * i) / (n - 1);
-      engine.launch(delay, randomBurst(x, y, rand(0.75, 0.95), false), Infinity, rand(0.42, 0.55));
+      engine.launch(delay, randomBurst(x, y, rand(0.9, 1.2), true), Infinity, rand(0.42, 0.55));
     }
     return;
   }
 
   // Celebration: an opening volley, then bursts spread across the screen.
   const smallScreen = w < 640;
-  const n = Math.max(6, Math.round((durationMs / 1000) * (smallScreen ? 2.6 : 3.8)));
+  const n = Math.max(10, Math.round((durationMs / 1000) * (smallScreen ? 3.6 : 5.2)));
   const launchWindow = Math.max(400, durationMs - 1700);
   const slots = Array.from({ length: n }, (_, i) => (i + 0.5) / n); // stratified x positions
   for (let i = slots.length - 1; i > 0; i--) {
@@ -506,11 +506,11 @@ function planShow(engine: FireworksEngine, intensity: 'light' | 'celebration', d
     [slots[i], slots[j]] = [slots[j], slots[i]];
   }
   for (let i = 0; i < n; i++) {
-    const volley = i < 3;
-    const delay = volley ? i * 90 : 250 + ((launchWindow - 250) * (i - 3)) / Math.max(1, n - 4) + rand(-120, 120);
-    const x = w * (0.08 + 0.84 * slots[i]);
-    const y = h * rand(0.12, 0.45);
-    engine.launch(delay, randomBurst(x, y, rand(0.8, 1.15), true), Infinity, rand(0.55, 0.8));
+    const volley = i < 4;
+    const delay = volley ? i * 85 : 220 + ((launchWindow - 220) * (i - 4)) / Math.max(1, n - 5) + rand(-100, 100);
+    const x = w * (0.06 + 0.88 * slots[i]);
+    const y = h * rand(0.1, 0.45);
+    engine.launch(delay, randomBurst(x, y, rand(0.95, 1.45), true), Infinity, rand(0.5, 0.75));
   }
 }
 
@@ -545,9 +545,9 @@ export function burstCrackers(opts?: { intensity?: 'light' | 'celebration'; dura
 // ---------------------------------------------------------------------------
 
 export interface HeroCrackersOptions {
-  /** Delay before the first pop after mount (ms). Default ~0.9–1.5 s. */
+  /** Delay before the first pop after mount (ms). Default ~300–600 ms. */
   firstDelayMs?: number;
-  /** Random gap between pops (ms). Default 6000–12000. */
+  /** Random gap between pops (ms). Default 1600–3200 ms for continuous festive excitement. */
   minDelayMs?: number;
   maxDelayMs?: number;
 }
@@ -561,17 +561,17 @@ export function useHeroCrackers(
   canvasRef: React.RefObject<HTMLCanvasElement>,
   options: HeroCrackersOptions = {}
 ): void {
-  const { firstDelayMs, minDelayMs = 6000, maxDelayMs = 12000 } = options;
+  const { firstDelayMs, minDelayMs = 1600, maxDelayMs = 3200 } = options;
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || typeof window === 'undefined' || prefersReducedMotion()) return;
 
     const engine = new FireworksEngine(canvas, {
-      maxSparks: Math.round(260 * deviceScale(window.innerWidth)),
+      maxSparks: Math.round(950 * deviceScale(window.innerWidth)),
       maxDpr: 1.5,
-      opacity: 0.9,
-      sparkLife: 1.0,
+      opacity: 0.95,
+      sparkLife: 1.25,
     });
 
     let inView = typeof IntersectionObserver === 'undefined';
@@ -589,11 +589,17 @@ export function useHeroCrackers(
       if (!(inView && docVisible) || prefersReducedMotion()) return;
       measure();
       const { width: w, height: h } = engine;
-      const n = Math.random() < 0.4 ? 2 : 1;
+      // Salvo of 2 to 3 vibrant cracker blasts
+      const n = Math.random() < 0.45 ? 3 : 2;
       for (let i = 0; i < n; i++) {
-        const x = w * rand(0.06, 0.94);
-        const y = h * rand(0.1, 0.42);
-        engine.launch(i * rand(250, 600), randomBurst(x, y, rand(0.6, 0.85), false), rand(150, 280), rand(0.38, 0.5));
+        const x = w * rand(0.08, 0.92);
+        const y = h * rand(0.08, 0.46);
+        engine.launch(
+          i * rand(120, 280),
+          randomBurst(x, y, rand(0.95, 1.45), true),
+          rand(180, 380),
+          rand(0.35, 0.48)
+        );
       }
       engine.start();
       popped = true;
@@ -604,7 +610,7 @@ export function useHeroCrackers(
       if (inView && docVisible) {
         engine.resume();
         if (timer === undefined) {
-          const delay = popped ? rand(2000, 5000) : firstDelayMs ?? rand(900, 1500);
+          const delay = popped ? rand(800, 1800) : firstDelayMs ?? rand(300, 600);
           timer = window.setTimeout(pop, delay);
         }
       } else {

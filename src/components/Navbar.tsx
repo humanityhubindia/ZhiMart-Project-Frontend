@@ -98,10 +98,15 @@ export const Navbar: React.FC<NavbarProps> = ({
               </div>
             </div>
 
-            {/* Brand Title */}
-            <span className="whitespace-nowrap text-lg min-[400px]:text-xl sm:text-2xl font-black tracking-tight text-slate-900 font-heading leading-none group-hover:text-amber-600 transition-colors">
-              ZHI-MART
-            </span>
+            {/* Brand Title & Subtitle */}
+            <div className="flex flex-col text-left">
+              <span className="whitespace-nowrap text-lg min-[400px]:text-xl sm:text-2xl font-black tracking-tight text-slate-900 font-heading leading-none group-hover:text-amber-600 transition-colors">
+                ZHI-MART
+              </span>
+              <span className="text-[9px] sm:text-[10px] font-black uppercase tracking-[0.22em] text-amber-600 leading-none mt-1">
+                Wholesales
+              </span>
+            </div>
           </button>
         </div>
 

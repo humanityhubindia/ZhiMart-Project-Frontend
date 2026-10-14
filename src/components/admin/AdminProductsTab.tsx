@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Archive, ArchiveRestore, Flame, Pencil, Plus, Search, ShoppingBag, Sparkles, Star, TrendingUp, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Clock, Flame, Pencil, Plus, Search, ShoppingBag, Star, TrendingUp, X } from 'lucide-react';
 import { useAdminProducts } from '../../hooks/admin/adminQueries';
 import { useArchiveProduct, useRestoreProduct } from '../../hooks/admin/adminMutations';
 import type { AdminProduct } from '../../types/admin';
@@ -59,7 +59,7 @@ function Flags({ p }: { p: AdminProduct }) {
   const flags = [
     p.isPopular && { icon: Star, label: 'Popular' },
     p.isBestSelling && { icon: TrendingUp, label: 'Best selling' },
-    p.isNewArrival && { icon: Sparkles, label: 'New arrival' },
+    p.isNewArrival && { icon: Clock, label: 'New arrival' },
     p.isParty && { icon: Flame, label: 'Party' },
   ].filter(Boolean) as { icon: React.ComponentType<{ className?: string }>; label: string }[];
   if (!flags.length) return <span className="text-slate-300">—</span>;
