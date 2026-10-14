@@ -1,6 +1,11 @@
 import React, { useState } from 'react';
-import { Send, Facebook, Twitter, Instagram, Linkedin, Apple, Play, Flame } from 'lucide-react';
-import { SUPPORT_PHONE_DISPLAY, SUPPORT_PHONE_TEL, supportWhatsAppUrl } from '../lib/contact';
+import { Send, Flame } from 'lucide-react';
+import {
+  BUSINESS_ADDRESS_LINES,
+  SUPPORT_PHONE_DISPLAY,
+  SUPPORT_PHONE_TEL,
+  supportWhatsAppUrl,
+} from '../lib/contact';
 
 export const Footer: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -72,27 +77,6 @@ export const Footer: React.FC = () => {
             <p className="text-xs text-[#6B707B] leading-relaxed max-w-sm">
               Direct factory fireworks from Sivakasi, Tamil Nadu. 100% genuine green crackers, safe Visco delay fuses, and verified PESO licensed distribution.
             </p>
-
-            {/* PlayStore & AppleStore Badges */}
-            <div className="flex flex-wrap items-center gap-3 pt-2">
-              <button
-                type="button"
-                onClick={() => alert('Zhi-mart Crackers App on Google Play')}
-                className="flex items-center gap-2.5 bg-[#DCE0E5] hover:bg-[#CCD1D8] text-[#282B31] px-4 py-2.5 rounded-xl text-xs font-bold transition-colors shadow-2xs"
-              >
-                <Play className="w-4 h-4 fill-current" />
-                <span>PlayStore</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => alert('Zhi-mart Crackers App on App Store')}
-                className="flex items-center gap-2.5 bg-[#DCE0E5] hover:bg-[#CCD1D8] text-[#282B31] px-4 py-2.5 rounded-xl text-xs font-bold transition-colors shadow-2xs"
-              >
-                <Apple className="w-4 h-4 fill-current" />
-                <span>AppleStore</span>
-              </button>
-            </div>
           </div>
 
           {/* COMPANY column */}
@@ -152,23 +136,14 @@ export const Footer: React.FC = () => {
                 </a>
               </p>
               <p>Email: sales@zhimartcrackers.com</p>
-              <p>Depot: Bypass Road, Sivakasi, TN, India</p>
-            </div>
-
-            {/* Social Icons row */}
-            <div className="flex items-center space-x-3 pt-3">
-              <a href="#facebook" className="w-8 h-8 rounded-lg bg-[#DDE1E6] hover:bg-[#CBD0D7] flex items-center justify-center text-[#3D4047]">
-                <Facebook className="w-4 h-4 fill-current" />
-              </a>
-              <a href="#twitter" className="w-8 h-8 rounded-lg bg-[#DDE1E6] hover:bg-[#CBD0D7] flex items-center justify-center text-[#3D4047]">
-                <Twitter className="w-4 h-4 fill-current" />
-              </a>
-              <a href="#instagram" className="w-8 h-8 rounded-lg bg-[#DDE1E6] hover:bg-[#CBD0D7] flex items-center justify-center text-[#3D4047]">
-                <Instagram className="w-4 h-4" />
-              </a>
-              <a href="#linkedin" className="w-8 h-8 rounded-lg bg-[#DDE1E6] hover:bg-[#CBD0D7] flex items-center justify-center text-[#3D4047]">
-                <Linkedin className="w-4 h-4 fill-current" />
-              </a>
+              <address className="not-italic leading-relaxed">
+                Address:
+                {BUSINESS_ADDRESS_LINES.map((line) => (
+                  <span key={line} className="block">
+                    {line}
+                  </span>
+                ))}
+              </address>
             </div>
           </div>
         </div>
