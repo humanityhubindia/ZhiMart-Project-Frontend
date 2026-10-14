@@ -67,7 +67,7 @@ export const OrderReceiptPrint: React.FC<{ order: GuestOrder; statusLabel: strin
               <p className="text-[10px] text-slate-500 leading-relaxed mt-0.5">
                 {BUSINESS_PROFILE.address}
                 <br />
-                Helpline: {BUSINESS_PROFILE.helpline}
+                Helpline: {BUSINESS_PROFILE.helpline} • Email: {BUSINESS_PROFILE.email}
               </p>
             </div>
           </div>

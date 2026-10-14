@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Send, Flame } from 'lucide-react';
 import {
   BUSINESS_ADDRESS_LINES,
+  BUSINESS_EMAIL,
   SUPPORT_PHONE_DISPLAY,
   SUPPORT_PHONE_TEL,
   supportWhatsAppUrl,
@@ -135,7 +136,12 @@ export const Footer: React.FC = () => {
                   {SUPPORT_PHONE_DISPLAY}
                 </a>
               </p>
-              <p>Email: sales@zhimartcrackers.com</p>
+              <p>
+                Email:{' '}
+                <a href={`mailto:${BUSINESS_EMAIL}`} className="hover:text-black transition-colors font-medium">
+                  {BUSINESS_EMAIL}
+                </a>
+              </p>
               <address className="not-italic leading-relaxed">
                 Address:
                 {BUSINESS_ADDRESS_LINES.map((line) => (

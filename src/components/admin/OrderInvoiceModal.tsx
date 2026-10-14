@@ -118,7 +118,7 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
                   <p className="text-[10px] text-slate-500 font-medium leading-relaxed mt-0.5 max-w-md">
                     {BUSINESS_PROFILE.address}
                     <br />
-                    Helpline: {BUSINESS_PROFILE.helpline}
+                    Helpline: {BUSINESS_PROFILE.helpline} • Email: {BUSINESS_PROFILE.email}
                     {(BUSINESS_PROFILE.gstin || BUSINESS_PROFILE.licence) && <br />}
                     {BUSINESS_PROFILE.gstin && <span className="font-bold text-slate-700">GSTIN: {BUSINESS_PROFILE.gstin}</span>}
                     {BUSINESS_PROFILE.gstin && BUSINESS_PROFILE.licence && ' • '}

@@ -1,5 +1,5 @@
 import { isApiError } from '../../lib/api';
-import { BUSINESS_ADDRESS } from '../../lib/contact';
+import { BUSINESS_ADDRESS, BUSINESS_EMAIL } from '../../lib/contact';
 import type {
   InventoryStatus,
   Order,
@@ -332,6 +332,7 @@ export const BUSINESS_PROFILE = {
   tagline: 'Direct Factory Fireworks • Sivakasi',
   address: BUSINESS_ADDRESS,
   helpline: '+91 95979 61800',
+  email: BUSINESS_EMAIL,
   gstin: null as string | null,
   licence: null as string | null,
 };
