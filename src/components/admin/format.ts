@@ -330,7 +330,7 @@ export const BUSINESS_PROFILE = {
   name: 'ZHI-MART FIREWORKS',
   tagline: 'Direct Factory Fireworks • Sivakasi',
   address: 'Bypass Road, Sivakasi, Virudhunagar Dist, Tamil Nadu, India',
-  helpline: '+91 98400 12345',
+  helpline: '+91 95979 61800',
   gstin: null as string | null,
   licence: null as string | null,
 };

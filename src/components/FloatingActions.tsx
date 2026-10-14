@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ArrowUp, PhoneCall, MessageCircle } from 'lucide-react';
+import { supportWhatsAppUrl } from '../lib/contact';
 
 export const FloatingActions: React.FC = () => {
   const [showScrollTop, setShowScrollTop] = useState(false);
@@ -17,7 +18,7 @@ export const FloatingActions: React.FC = () => {
   };
 
   const openWhatsApp = () => {
-    window.open('https://wa.me/919840012345?text=Hello%20Zhi-mart%20Crackers,%20I%20want%20to%20order%20crackers!', '_blank');
+    window.open(supportWhatsAppUrl('Hello Zhi-mart Crackers, I want to order crackers!'), '_blank', 'noopener,noreferrer');
   };
 
   return (

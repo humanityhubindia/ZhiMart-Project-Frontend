@@ -45,6 +45,7 @@ import {
 import { PaymentHistoryPanel, PaymentPanel } from './PaymentDetails';
 import { useNow } from './useNow';
 import { OrderInvoiceModal } from './OrderInvoiceModal';
+import { orderCharges } from '../../lib/money';
 import {
   AttentionBadge,
   Button,
@@ -227,6 +228,9 @@ export function AdminOrderDetailPage({ target, onBack }: Props) {
   }
 
   if (!order) return null;
+  const charges = orderCharges(order);
+  // Savings are on goods (subtotal) only — the delivery charge is not part of them.
+  const discount = Math.max(0, Math.round((order.mrpTotal - charges.subtotal) * 100) / 100);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-150">
@@ -476,12 +480,28 @@ export function AdminOrderDetailPage({ target, onBack }: Props) {
                 <span>Total Items</span>
                 <span>{order.itemCount} units</span>
               </div>
-              {order.mrpTotal > order.totalAmount && (
+              {discount > 0 && (
                 <div className="flex justify-between text-emerald-700 font-bold">
                   <span>Festival Discount (Savings)</span>
-                  <span>−{formatINR(order.mrpTotal - order.totalAmount)}</span>
+                  <span>−{formatINR(discount)}</span>
                 </div>
               )}
+              <div className="flex justify-between text-slate-700 font-bold">
+                <span>Subtotal</span>
+                <span>{formatINR(charges.subtotal)}</span>
+              </div>
+              <div className="flex justify-between text-slate-500 font-semibold">
+                <span>Delivery charge</span>
+                {charges.deliveryFee > 0 ? (
+                  <span className="text-slate-700">{formatINR(charges.deliveryFee)}</span>
+                ) : (
+                  <span className="text-emerald-600 font-black">FREE</span>
+                )}
+              </div>
+              <div className="flex justify-between text-slate-500 font-semibold">
+                <span>Tax (GST)</span>
+                <span className="text-slate-700">{formatINR(0)}</span>
+              </div>
               <div className="flex justify-between text-base font-black text-slate-950 pt-2 border-t border-slate-100">
                 <span>Total Payable:</span>
                 <span className="text-amber-600 font-heading text-lg">

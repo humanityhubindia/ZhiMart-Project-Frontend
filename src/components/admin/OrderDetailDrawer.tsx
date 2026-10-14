@@ -38,6 +38,7 @@ import {
   OrderStatusDialog,
 } from './OrderActionDialogs';
 import { PaymentHistoryPanel, PaymentPanel } from './PaymentDetails';
+import { orderCharges } from '../../lib/money';
 import { useNow } from './useNow';
 import { OrderInvoiceModal } from './OrderInvoiceModal';
 import {
@@ -126,7 +127,8 @@ function OrderBody({ order, isFetching, onRefresh }: { order: Order; isFetching:
   const wa = whatsappLink(order);
   const c = order.customer;
   const timeline = buildTimeline(order);
-  const discount = Math.max(0, order.mrpTotal - order.totalAmount);
+  const { subtotal, deliveryFee } = orderCharges(order);
+  const discount = Math.max(0, Math.round((order.mrpTotal - subtotal) * 100) / 100);
 
   return (
     <div className="p-4 sm:p-6 space-y-4">
@@ -297,6 +299,11 @@ function OrderBody({ order, isFetching, onRefresh }: { order: Order; isFetching:
         <dl className="mt-3 pt-3 border-t border-slate-100">
           <Row label="MRP total">{formatINR(order.mrpTotal)}</Row>
           {discount > 0 && <Row label="Discount">−{formatINR(discount)}</Row>}
+          <Row label="Subtotal">{formatINR(subtotal)}</Row>
+          <Row label="Delivery charge">
+            {deliveryFee > 0 ? formatINR(deliveryFee) : <span className="text-emerald-600">FREE</span>}
+          </Row>
+          <Row label="Tax (GST)">{formatINR(0)}</Row>
           <div className="flex justify-between gap-3 pt-1">
             <dt className="text-sm font-black text-slate-950">Total</dt>
             <dd className="text-base font-black text-amber-600 tabular-nums">{formatINR(order.totalAmount)}</dd>

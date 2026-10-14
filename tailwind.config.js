@@ -43,6 +43,13 @@ export default {
           'Roboto',
           'sans-serif',
         ],
+        // Tamil script (e.g. சிவகாசி in the hero); Latin glyphs fall through to the heading font.
+        tamil: [
+          '"Noto Sans Tamil"',
+          '"Plus Jakarta Sans"',
+          'Inter',
+          'sans-serif',
+        ],
       },
       borderRadius: {
         lg: 'var(--radius)',

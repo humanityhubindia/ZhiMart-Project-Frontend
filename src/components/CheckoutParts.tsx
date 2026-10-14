@@ -1,10 +1,11 @@
 import React from 'react';
-import { AlertCircle, Clock, PackageX, WifiOff, X } from 'lucide-react';
+import { AlertCircle, Clock, MapPin, PackageX, Truck, WifiOff, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { CheckoutErrors, CheckoutField, CheckoutFormValues } from '../lib/checkout';
+import { CheckoutErrors, CheckoutField, CheckoutFormValues, REQUIRED_CHECKOUT_FIELDS } from '../lib/checkout';
 import { CheckoutFailure } from '../hooks/useCheckout';
 import { StockShortage } from '../lib/api';
 import { CartItem } from '../types';
+import { CartTotals, formatRupees, freeDeliveryHint } from '../lib/money';
 
 // ---------------------------------------------------------------------------
 // Form fields
@@ -19,6 +20,9 @@ interface CheckoutFieldsProps {
   variant?: 'page' | 'compact';
   idPrefix?: string;
 }
+
+/** Fields covered by the "Delivery available only in Tamil Nadu" notice. */
+const ADDRESS_FIELDS: readonly CheckoutField[] = ['address', 'city', 'pincode'];
 
 export const CheckoutFields: React.FC<CheckoutFieldsProps> = ({
   values,
@@ -40,6 +44,7 @@ export const CheckoutFields: React.FC<CheckoutFieldsProps> = ({
           : 'border-slate-300 focus:border-slate-800'
     );
 
+  const regionId = `${idPrefix}-delivery-region`;
   const field = (
     name: CheckoutField,
     label: string,
@@ -47,30 +52,55 @@ export const CheckoutFields: React.FC<CheckoutFieldsProps> = ({
       id: string;
       value: string;
       disabled?: boolean;
+      required: boolean;
+      'aria-required': boolean;
       'aria-invalid': boolean;
       'aria-describedby'?: string;
       className: string;
       onChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
     }) => React.ReactNode,
-    optional = false
+    hint?: string
   ) => {
     const id = `${idPrefix}-${name}`;
     const errId = `${id}-error`;
+    const hintId = `${id}-hint`;
+    const required = REQUIRED_CHECKOUT_FIELDS.includes(name);
+    const describedBy = [
+      ADDRESS_FIELDS.includes(name) ? regionId : null,
+      hint ? hintId : null,
+      errors[name] ? errId : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
     return (
       <div className="space-y-1">
         <label htmlFor={id} className={labelCls}>
           {label}
-          {optional && <span className="font-medium text-slate-400"> (optional)</span>}
+          {required ? (
+            <span aria-hidden="true" className="text-rose-600 font-black ml-0.5">
+              *
+            </span>
+          ) : (
+            <span className="font-medium text-slate-400"> (optional)</span>
+          )}
         </label>
         {input({
           id,
           value: values[name],
           disabled,
+          // `noValidate` on the form keeps the browser's own bubbles off; this is for assistive tech.
+          required,
+          'aria-required': required,
           'aria-invalid': Boolean(errors[name]),
-          'aria-describedby': errors[name] ? errId : undefined,
+          'aria-describedby': describedBy || undefined,
           className: inputCls(name),
           onChange: (e) => onChange(name, e.target.value),
         })}
+        {hint && (
+          <p id={hintId} className="text-[10px] font-medium text-slate-400">
+            {hint}
+          </p>
+        )}
         {errors[name] && (
           <p id={errId} className="text-[11px] font-semibold text-rose-600">
             {errors[name]}
@@ -82,39 +112,59 @@ export const CheckoutFields: React.FC<CheckoutFieldsProps> = ({
 
   return (
     <div className="space-y-3">
-      {field('name', 'Full Name', (p) => (
-        <input {...p} type="text" autoComplete="name" placeholder="Enter recipient name" maxLength={100} />
+      <p className="text-[10px] font-semibold text-slate-400">
+        Fields marked <span className="text-rose-600 font-black">*</span> are required.
+      </p>
+      {field('name', 'Name', (p) => (
+        <input {...p} type="text" autoComplete="name" placeholder="Enter your full name" maxLength={100} />
       ))}
       {field('phone', 'WhatsApp Mobile Number', (p) => (
-        <input {...p} type="tel" inputMode="tel" autoComplete="tel" placeholder="+91 98765 43210" maxLength={20} />
-      ))}
-      {field('email', "Email — we'll send your order confirmation and tracking link", (p) => (
         <input
           {...p}
-          type="email"
-          inputMode="email"
-          autoComplete="email"
-          autoCapitalize="off"
-          spellCheck={false}
-          placeholder="you@example.com"
-          maxLength={254}
-          required
-          aria-required="true"
+          type="tel"
+          inputMode="tel"
+          autoComplete="tel"
+          placeholder="Enter 10-digit mobile number"
+          maxLength={20}
         />
       ))}
+      {field(
+        'email',
+        'Email',
+        (p) => (
+          <input
+            {...p}
+            type="email"
+            inputMode="email"
+            autoComplete="email"
+            autoCapitalize="off"
+            spellCheck={false}
+            placeholder="Enter your email address"
+            maxLength={254}
+          />
+        ),
+        "We'll send your order confirmation and tracking link here."
+      )}
+      <p
+        id={regionId}
+        className="flex items-center gap-1.5 text-[11px] font-bold text-amber-900 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2"
+      >
+        <MapPin className="w-3.5 h-3.5 text-amber-600 shrink-0" aria-hidden="true" />
+        Delivery available only in Tamil Nadu
+      </p>
       {field('address', 'Delivery Address', (p) => (
         <textarea
           {...p}
           rows={2}
           autoComplete="street-address"
-          placeholder="House No, Street, Landmark"
+          placeholder="House no., street, area, landmark"
           maxLength={500}
           className={cn(p.className, 'resize-none')}
         />
       ))}
       <div className="grid grid-cols-2 gap-2.5">
         {field('city', 'City', (p) => (
-          <input {...p} type="text" autoComplete="address-level2" placeholder="Chennai / Madurai" maxLength={100} />
+          <input {...p} type="text" autoComplete="address-level2" placeholder="Enter your city" maxLength={100} />
         ))}
         {field('pincode', 'Pincode', (p) => (
           <input
@@ -122,28 +172,20 @@ export const CheckoutFields: React.FC<CheckoutFieldsProps> = ({
             type="text"
             inputMode="numeric"
             autoComplete="postal-code"
-            placeholder="600028"
+            placeholder="Enter 6-digit pincode"
             maxLength={6}
           />
         ))}
       </div>
-      {field('state', 'State', (p) => (
-        <input {...p} type="text" autoComplete="address-level1" placeholder="Tamil Nadu" maxLength={100} />
+      {field('notes', 'Order Notes', (p) => (
+        <textarea
+          {...p}
+          rows={2}
+          placeholder="Delivery instructions, preferred dispatch date…"
+          maxLength={1000}
+          className={cn(p.className, 'resize-none')}
+        />
       ))}
-      {field(
-        'notes',
-        'Order Notes',
-        (p) => (
-          <textarea
-            {...p}
-            rows={2}
-            placeholder="Delivery instructions, preferred dispatch date…"
-            maxLength={1000}
-            className={cn(p.className, 'resize-none')}
-          />
-        ),
-        true
-      )}
     </div>
   );
 };
@@ -256,4 +298,58 @@ export const CartLineNotice: React.FC<{ item: CartItem; className?: string }> = 
     );
   }
   return null;
+};
+
+// ---------------------------------------------------------------------------
+// Billing lines (subtotal / delivery / tax)
+// ---------------------------------------------------------------------------
+
+/** "₹350", or a green "FREE" when no delivery charge applies. */
+export const DeliveryChargeValue: React.FC<{ fee: number; className?: string }> = ({ fee, className }) =>
+  fee > 0 ? (
+    <span className={cn('font-semibold text-slate-800 tabular-nums', className)}>₹{formatRupees(fee)}</span>
+  ) : (
+    <span className={cn('font-extrabold text-emerald-600', className)}>FREE</span>
+  );
+
+/**
+ * The Subtotal → Delivery charge → Tax (GST) lines shown above the payable total on the cart,
+ * drawer and order page. Subtotal is the goods value after tier pricing.
+ */
+export const BillingLines: React.FC<{ subtotal: number; deliveryFee: number; className?: string }> = ({
+  subtotal,
+  deliveryFee,
+  className,
+}) => (
+  <div className={cn('space-y-1.5 text-xs', className)}>
+    <div className="flex items-center justify-between text-slate-700 font-semibold">
+      <span>Subtotal</span>
+      <span className="tabular-nums">₹{formatRupees(subtotal)}</span>
+    </div>
+    <div className="flex items-center justify-between text-slate-600 font-medium">
+      <span>Delivery charge</span>
+      <DeliveryChargeValue fee={deliveryFee} />
+    </div>
+    <div className="flex items-center justify-between text-slate-600 font-medium">
+      <span>Tax (GST)</span>
+      <span className="font-semibold text-slate-800 tabular-nums">₹0</span>
+    </div>
+  </div>
+);
+
+/** "Add ₹X more for FREE delivery (free on orders ₹5,000+)" — renders nothing once delivery is free. */
+export const FreeDeliveryHint: React.FC<{ totals: CartTotals; className?: string }> = ({ totals, className }) => {
+  const hint = freeDeliveryHint(totals);
+  if (!hint) return null;
+  return (
+    <p
+      className={cn(
+        'flex items-start gap-1.5 text-[11px] font-bold text-sky-900 bg-sky-50 border border-sky-200 rounded-xl px-2.5 py-1.5',
+        className
+      )}
+    >
+      <Truck className="w-3.5 h-3.5 text-sky-600 shrink-0 mt-px" aria-hidden="true" />
+      <span>{hint}</span>
+    </p>
+  );
 };

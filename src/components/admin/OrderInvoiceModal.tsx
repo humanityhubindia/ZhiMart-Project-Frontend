@@ -3,6 +3,7 @@ import { MessageCircle, Printer, X } from 'lucide-react';
 import type { Order } from '../../types/admin';
 import { usePricingRules } from '../../hooks/useProducts';
 import { pricingTierLabel } from '../../lib/pricingTier';
+import { NO_TAX_NOTE, orderCharges } from '../../lib/money';
 import {
   BUSINESS_PROFILE,
   formatDateTime,
@@ -32,7 +33,9 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
 
   if (!order) return null;
   const wa = whatsappLink(order);
-  const discount = Math.max(0, Math.round((order.mrpTotal - order.totalAmount) * 100) / 100);
+  const { subtotal, deliveryFee } = orderCharges(order);
+  // Discount is on goods (subtotal) only — the delivery charge is not part of it.
+  const discount = Math.max(0, Math.round((order.mrpTotal - subtotal) * 100) / 100);
   const discountPct = order.mrpTotal > 0 ? Math.round((discount / order.mrpTotal) * 100) : 0;
   const c = order.customer;
   // Test orders are charged ₹1/unit, so the price tier doesn't apply to them.
@@ -247,10 +250,27 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
                     <span className="font-black text-slate-900">Pricing:</span> {tierLine}
                   </p>
                 )}
+                <div className="pt-2 border-t border-slate-200 flex justify-between font-bold text-slate-800">
+                  <span>Subtotal:</span>
+                  <span className="tabular-nums">{formatINR(subtotal)}</span>
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>Delivery charge:</span>
+                  {deliveryFee > 0 ? (
+                    <span className="font-semibold text-slate-700 tabular-nums">{formatINR(deliveryFee)}</span>
+                  ) : (
+                    <span className="font-black text-emerald-700">FREE</span>
+                  )}
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>Tax (GST):</span>
+                  <span className="font-semibold text-slate-700 tabular-nums">{formatINR(0)}</span>
+                </div>
                 <div className="pt-2 border-t border-slate-200 flex justify-between items-center text-sm font-black text-slate-950">
                   <span>TOTAL:</span>
                   <span className="text-base text-amber-600 font-heading tabular-nums">{formatINR(order.totalAmount)}</span>
                 </div>
+                <p className="text-[10px] text-emerald-700 font-bold text-right">{NO_TAX_NOTE}</p>
                 <p className="text-[10px] text-slate-500 font-medium pt-1 text-right italic">
                   Amount in words: {numberToWords(order.totalAmount)}
                 </p>

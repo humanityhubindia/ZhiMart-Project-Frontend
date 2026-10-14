@@ -14,6 +14,7 @@ import {
 import { UserProfile } from '../types';
 import { CartTotals, formatRupees } from '../lib/money';
 import { useTestMode } from '../hooks/useProducts';
+import { supportWhatsAppUrl } from '../lib/contact';
 
 interface NavbarProps {
   onOpenAuth: (step?: 'login') => void;
@@ -69,8 +70,9 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const handleSupportClick = () => {
     window.open(
-      'https://wa.me/919840012345?text=Hello%20Zhi-mart%20Support,%20I%20need%20help%20with%20crackers%20order',
-      '_blank'
+      supportWhatsAppUrl('Hello Zhi-mart Support, I need help with crackers order'),
+      '_blank',
+      'noopener,noreferrer'
     );
   };
 
@@ -96,15 +98,10 @@ export const Navbar: React.FC<NavbarProps> = ({
               </div>
             </div>
 
-            {/* Brand Title & Tagline */}
-            <div className="flex flex-col whitespace-nowrap">
-              <span className="text-lg min-[400px]:text-xl sm:text-2xl font-black tracking-tight text-slate-900 font-heading leading-tight group-hover:text-amber-600 transition-colors">
-                ZHI-MART
-              </span>
-              <span className="text-[9px] font-extrabold uppercase tracking-wider sm:tracking-widest text-slate-400 -mt-0.5">
-                Sivakasi Direct
-              </span>
-            </div>
+            {/* Brand Title */}
+            <span className="whitespace-nowrap text-lg min-[400px]:text-xl sm:text-2xl font-black tracking-tight text-slate-900 font-heading leading-none group-hover:text-amber-600 transition-colors">
+              ZHI-MART
+            </span>
           </button>
         </div>
 

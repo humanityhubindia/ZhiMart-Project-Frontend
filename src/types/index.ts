@@ -25,7 +25,7 @@ export interface CrackerProduct {
   discountPercent: number; // bulk discount vs MRP, e.g. 85
   /** Standard price — charged on every line while the cart's list total is below the threshold. */
   standardPrice: number; // e.g. 63
-  standardDiscountPercent: number; // e.g. 70
+  standardDiscountPercent: number; // e.g. 75
   image: string;
   gallery?: string[];
   description: string;

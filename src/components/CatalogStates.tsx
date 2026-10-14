@@ -59,7 +59,7 @@ export const ProductCardSkeleton: React.FC = () => (
         </div>
         <p className="text-[11px] leading-snug text-transparent bg-slate-50 border border-slate-200/80 rounded-lg px-2.5 py-1.5">
           Below ₹10,000 order: <span className="font-extrabold">₹100</span>{' '}
-          <span className="whitespace-nowrap">(70% OFF)</span>
+          <span className="whitespace-nowrap">(75% OFF)</span>
         </p>
       </div>
     </div>

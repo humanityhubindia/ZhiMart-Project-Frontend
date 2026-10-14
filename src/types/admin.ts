@@ -71,7 +71,7 @@ export interface AdminProduct {
   price: number;
   originalPrice: number;
   discountPercent: number;
-  /** Price charged below the bulk threshold (≈70% off MRP; never below `price`). Derived by the server. */
+  /** Price charged below the bulk threshold (≈75% off MRP; never below `price`). Derived by the server. */
   standardPrice?: number;
   standardDiscountPercent?: number;
   image: string;
@@ -232,6 +232,11 @@ export interface Order {
   items: OrderItem[];
   itemCount: number;
   mrpTotal: number;
+  /** Goods value after tier pricing (rupees). Absent on orders placed before delivery charges — use `orderCharges()`. */
+  subtotal?: number;
+  /** Delivery charge (rupees, 0 = free). Absent on older orders (treat as 0). */
+  deliveryFee?: number;
+  /** Amount payable, including `deliveryFee`. */
   totalAmount: number;
   status: OrderStatus;
   payment: OrderPayment;

@@ -13,6 +13,7 @@ import {
   Building2,
   BadgeCheck,
 } from 'lucide-react';
+import { HeroCrackers } from '../lib/crackerPop';
 
 interface HeroSectionProps {
   onExploreProducts: () => void;
@@ -48,7 +49,7 @@ const TRUSTED_PERSONS: TrustedPerson[] = [
     title: 'Trusted By Them',
     badge: 'Trusted By Them',
     subtitle: 'Factory-Direct Patron',
-    quote: '“Zero retail markups and transparent pricing — Sivakasi’s freshest crackers safely delivered with 100% free shipping.”',
+    quote: '“Zero retail markups and transparent pricing — Sivakasi’s freshest crackers safely delivered, free on orders of ₹5,000+.”',
     highlight: 'Direct-To-Home Advocate',
     objectPosition: 'object-center',
   },
@@ -73,8 +74,11 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   const currentPerson = TRUSTED_PERSONS[currentIdx];
 
   return (
-    <section className="relative w-full bg-gradient-to-b from-white via-slate-50/70 to-[#F8F9FA] border-b border-slate-200/80 pt-10 pb-14 sm:pt-14 sm:pb-16 px-4 sm:px-6 lg:px-8 text-left">
-      <div className="max-w-7xl mx-auto space-y-12">
+    <section className="relative isolate w-full bg-gradient-to-b from-white via-slate-50/70 to-[#F8F9FA] border-b border-slate-200/80 pt-10 pb-14 sm:pt-14 sm:pb-16 px-4 sm:px-6 lg:px-8 text-left">
+      {/* Occasional Diwali cracker pops — behind the content, never blocks clicks */}
+      <HeroCrackers className="absolute inset-x-0 top-0 z-0 h-full max-h-[780px] w-full" />
+
+      <div className="relative z-[1] max-w-7xl mx-auto space-y-12">
         {/* Main 2-Column Showcase */}
         <div className="grid grid-cols-1 md:grid-cols-12 gap-8 lg:gap-12 items-center">
           {/* Left Column (7 cols): Editorial Copy & Primary Actions */}
@@ -90,15 +94,18 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
             </div>
 
             {/* Main Headline */}
-            <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-5xl font-black text-slate-950 tracking-tight font-heading leading-[1.14]">
+            <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-5xl font-black text-slate-950 tracking-tight font-heading leading-[1.2]">
               Crackers Directly From{' '}
-              <span className="text-amber-600">Sivakasi</span> With Free Delivery.
+              <span lang="ta" className="font-tamil tracking-normal text-amber-600 text-[0.92em]">
+                சிவகாசி
+              </span>{' '}
+              With Free Delivery.
             </h1>
 
             {/* Sub-headline */}
             <p className="text-sm sm:text-base lg:text-lg text-slate-600 font-medium leading-relaxed max-w-2xl">
-              Order fresh 2025 factory fireworks dispatched straight from certified manufacturing units in Sivakasi.
-              Zero retail markups, zero middleman margins — enjoy <strong className="text-slate-900 font-extrabold">100% Free Insured Delivery</strong> and a <strong className="text-slate-900 font-extrabold">Flat 45% Factory Wholesale Discount</strong>.
+              Order fresh 2026 factory fireworks dispatched straight from certified manufacturing units in Sivakasi.
+              Zero retail markups, zero middleman margins — enjoy <strong className="text-slate-900 font-extrabold">100% Free Insured Delivery</strong> and a <strong className="text-slate-900 font-extrabold">Flat 75% Factory Wholesale Discount</strong>.
             </p>
 
             {/* Quick Action Buttons */}
@@ -142,7 +149,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               </div>
               <div className="inline-flex items-center gap-1.5 bg-emerald-50/90 border border-emerald-200/90 text-emerald-900 px-3 py-1.5 rounded-lg shadow-2xs">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                <span>100% Free Insured Transit</span>
+                <span>Insured Transit Across Tamil Nadu</span>
               </div>
               <div className="inline-flex items-center gap-1.5 bg-emerald-50/90 border border-emerald-200/90 text-emerald-900 px-3 py-1.5 rounded-lg shadow-2xs">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
@@ -241,10 +248,10 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               <Truck className="w-5 h-5 text-emerald-600" />
             </div>
             <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              100% Free Delivery
+              Free Delivery on ₹5,000+
             </h3>
             <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              100% free delivery across India with insured fireworks cargo transit partners and live docket tracking.
+              Free delivery on orders of ₹5,000 and above across Tamil Nadu, with insured transit and live docket tracking. Smaller orders ship for a flat ₹350.
             </p>
           </div>
 
@@ -254,10 +261,10 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               <Percent className="w-5 h-5 text-blue-600" />
             </div>
             <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              Flat 45% Factory Rates
+              Flat 75% Factory Rates
             </h3>
             <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Wholesale factory rate cards applied automatically. Save up to half compared to local retail fireworks stalls.
+              Wholesale factory rate cards applied automatically. Save far more than at local retail fireworks stalls.
             </p>
           </div>
 

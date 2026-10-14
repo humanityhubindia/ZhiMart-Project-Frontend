@@ -32,7 +32,7 @@ type PriceOf = (p: CrackerProduct) => number;
  *    total actually reaches the threshold — otherwise the standard price would apply and the plan
  *    would overshoot the budget, so it is re-planned at the standard price.
  *  - Budget below the threshold: planned at the standard price.
- * The plan's real cost is always `computeTotals(items, rules).total`.
+ * The plan's real goods cost is always `computeTotals(items, rules).subtotal` (delivery is added at checkout).
  */
 export function planForBudget(
   budget: number,
@@ -170,7 +170,7 @@ export const AIAssistantPage: React.FC<AIAssistantPageProps> = ({
   const comboItems = planForBudget(budget, rules, testMode, generateCombo);
   const comboTotals = computeTotals(comboItems, rules);
   const {
-    total: comboTotal,
+    subtotal: comboTotal,
     mrpTotal: comboOriginal,
     savings: comboSavings,
     units: totalItemCount,
@@ -642,7 +642,7 @@ export const AIAssistantPage: React.FC<AIAssistantPageProps> = ({
               <Flame className="w-5 h-5 text-amber-500 shrink-0" />
               <div>
                 <p className="text-xs font-bold text-slate-800">Fresh Factory Stock</p>
-                <p className="text-[10px] text-slate-500">2025 new production</p>
+                <p className="text-[10px] text-slate-500">2026 new production</p>
               </div>
             </div>
           </div>
