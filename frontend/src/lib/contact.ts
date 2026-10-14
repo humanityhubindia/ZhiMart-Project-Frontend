@@ -13,6 +13,9 @@ export function supportWhatsAppUrl(message: string): string {
   return `https://wa.me/${BUSINESS_WHATSAPP_NUMBER}?text=${encodeURIComponent(message)}`;
 }
 
+/** Official company email for customer support and orders. */
+export const BUSINESS_EMAIL = 'zhimartwholesale@gmail.com';
+
 /** Shop address, shown in the footer and printed on receipts/invoices. */
 export const BUSINESS_ADDRESS_LINES = [
   '273, Kamarajar Road,',
