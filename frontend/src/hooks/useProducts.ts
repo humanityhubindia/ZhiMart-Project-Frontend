@@ -84,7 +84,8 @@ export function useTestMode(): boolean {
  */
 export function usePricingRules(): PricingRules {
   const catalog = useQuery<Catalog, Error, PricingRules>({ ...catalogQueryOptions, select: selectPricing });
-  return catalog.data ?? DEFAULT_PRICING;
+  const config = useStorefrontConfig();
+  return catalog.data ?? config.data?.pricing ?? DEFAULT_PRICING;
 }
 
 /** Refetch the catalog (e.g. after an order or a stock conflict). */

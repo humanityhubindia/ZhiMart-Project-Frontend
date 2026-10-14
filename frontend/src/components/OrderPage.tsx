@@ -26,11 +26,12 @@ import { cn } from '@/lib/utils';
 import { isApiError } from '../lib/api';
 import { fetchGuestOrder, GuestOrder, PricingTier } from '../lib/ordersApi';
 import { buildOrderShareMessage, maskEmail, openWhatsApp } from '../lib/checkout';
-import { formatRupees } from '../lib/money';
+import { formatRupees, NO_TAX_NOTE, sumRupees } from '../lib/money';
 import { useOrderPayment } from '../hooks/useOrderPayment';
 import { STOREFRONT_CONFIG_QUERY_KEY, useOnlinePaymentsEnabled, usePricingRules } from '../hooks/useProducts';
 import { CatalogErrorCard, errorMessage } from './CatalogStates';
 import { OrderReceiptPrint } from './OrderReceipt';
+import { BillingLines } from './CheckoutParts';
 
 interface OrderPageProps {
   orderNumber: string;
@@ -280,6 +281,9 @@ export const OrderPage: React.FC<OrderPageProps> = ({
     : isPayLater && (order.status === 'pending_pack' || isPendingPayment)
       ? 'Order received'
       : STATUS_LABELS[order.status] ?? order.status;
+
+  // Savings are on goods only — the delivery fee is not a discount.
+  const goodsSavings = Math.max(0, sumRupees([order.mrpTotal, -order.subtotal]));
 
   const shareOnWhatsApp = () =>
     openWhatsApp(
@@ -604,7 +608,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
             ))}
           </div>
           <div className="border-t border-slate-200 pt-3 space-y-1.5 text-xs">
-            {!order.isTest && order.mrpTotal > order.totalAmount && (
+            {!order.isTest && goodsSavings > 0 && (
               <>
                 <div className="flex items-center justify-between text-slate-500">
                   <span>Total MRP</span>
@@ -612,7 +616,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
                 </div>
                 <div className="flex items-center justify-between text-emerald-600 font-bold">
                   <span>You saved</span>
-                  <span>₹{formatRupees(order.mrpTotal - order.totalAmount)}</span>
+                  <span>₹{formatRupees(goodsSavings)}</span>
                 </div>
               </>
             )}
@@ -627,8 +631,12 @@ export const OrderPage: React.FC<OrderPageProps> = ({
                 bulkMinOrder={pricing.bulkMinOrder}
               />
             )}
-            <div className="flex items-center justify-between text-sm font-black text-slate-900 pt-1">
-              <span>{isPaid ? 'Amount paid' : isPayLater ? 'Amount payable' : 'Order total'}</span>
+            <BillingLines subtotal={order.subtotal} deliveryFee={order.deliveryFee} className="pt-1" />
+            <div className="flex items-center justify-between text-sm font-black text-slate-900 pt-2 border-t border-slate-100">
+              <span>
+                {isPaid ? 'Amount paid' : isPayLater ? 'Amount payable' : 'Order total'}
+                <span className="block text-[10px] font-bold text-emerald-600">{NO_TAX_NOTE}</span>
+              </span>
               <span>₹{formatRupees(order.totalAmount)}</span>
             </div>
             {clientEstimate && !order.isTest && Math.abs(clientEstimate.total - order.totalAmount) >= 0.01 && (

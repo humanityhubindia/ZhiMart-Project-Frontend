@@ -165,7 +165,7 @@ Additional error codes:
 `availableQuantity = min(stock, 1000)`; `inStock = stock > 0`.
 `price` is the price-list ("bulk") price; `standardPrice` is what the product costs in an
 order below the bulk minimum (see **Pricing tiers** below; for zm26-001: `price` 32,
-`originalPrice` 210, `standardPrice` 63, `standardDiscountPercent` 70).
+`originalPrice` 210, `standardPrice` 53 (₹52.50 rounded up), `standardDiscountPercent` 75).
 `standardDiscountPercent` = discount of `standardPrice` off `originalPrice`. Both are also in
 `AdminProduct` (always real prices).
 
@@ -175,14 +175,28 @@ Decided per order, server-side, from the DB prices:
 - `listTotal >= pricing.bulkMinOrder` (default ₹10,000, inclusive) ⇒ **`bulk`**: every line at `price`.
 - otherwise ⇒ **`standard`**: every line at `standardPrice =
   max(price, min(originalPrice, ceilToRupee(originalPrice × (100 − standardDiscountPercent) / 100)))`
-  (default 70 % off MRP). A product discounted less than that costs `price` in both tiers.
+  (default 75 % off MRP). A product discounted less than that costs `price` in both tiers.
 - `PAYMENT_TEST_MODE`: tier recorded as above, but every unit is charged ₹1 (`price` and
   `standardPrice` are both 1 on the storefront).
 
-The rule itself is published as `pricing` (rupees / whole percents; config
-`BULK_MIN_ORDER_RUPEES`, `BULK_DISCOUNT_PERCENT` (label only), `STANDARD_DISCOUNT_PERCENT`):
+### Delivery charge
+Also decided server-side, after tier pricing:
+- `subtotal = Σ lineTotal` (the goods at the prices actually charged).
+- `subtotal < pricing.freeDeliveryMin` (default ₹5,000) ⇒ `deliveryFee = pricing.deliveryFee`
+  (default ₹350); `subtotal >= freeDeliveryMin` (inclusive) ⇒ `deliveryFee = 0`.
+  `freeDeliveryMin` 0 ⇒ delivery is always free.
+- `totalAmount = subtotal + deliveryFee` is the payable amount: it is what Razorpay is asked
+  for, what verification checks, what refunds are capped at, and what dashboard revenue counts.
+  GST: prices are tax-inclusive, no tax is added (emails show "Tax (GST): ₹0").
+- `PAYMENT_TEST_MODE`: the fee is ₹1 (published as `deliveryFee: 1`), applied when the ₹1-per-unit
+  subtotal is below `freeDeliveryMin`, so the storefront's own calculation still matches.
+- Orders placed before the delivery charge existed have `deliveryFee: 0`.
+
+Both rules are published as `pricing` (rupees / whole percents; config
+`BULK_MIN_ORDER_RUPEES`, `BULK_DISCOUNT_PERCENT` (label only), `STANDARD_DISCOUNT_PERCENT`,
+`DELIVERY_FEE_RUPEES`, `FREE_DELIVERY_MIN_RUPEES`):
 ```json
-"pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 70 }
+"pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75, "deliveryFee": 350, "freeDeliveryMin": 5000 }
 ```
 
 `AdminProduct` = `Product` + `{ "stock": 120, "lowStockThreshold": 20, "bayLocation": "Bay B-1", "isActive": true, "sortOrder": 0, "version": 3, "createdAt": "…", "updatedAt": "…" }` (exact `stock`, not capped).
@@ -212,7 +226,7 @@ The rule itself is published as `pricing` (rupees / whole percents; config
   "notes": null,
   "items": [ { "productId": "zm-03", "productName": "4\" Lakshmi", "packInfo": "10 Packet(s)",
                "quantity": 10, "unitPrice": 165, "unitMrp": 300, "lineTotal": 1650 } ],
-  "itemCount": 10, "mrpTotal": 3000, "totalAmount": 1650,
+  "itemCount": 10, "mrpTotal": 3000, "subtotal": 1650, "deliveryFee": 350, "totalAmount": 2000,
   "pricingTier": "standard",
   "status": "pending_pack",
   "payment": { "method": "pay_later", "status": "pending", "reference": null, "paidAt": null, "refundedAt": null },
@@ -226,10 +240,12 @@ Order `status`: `pending_pack → dispatched → in_transit → out_for_delivery
 `method`: `pay_later | upi | card | netbanking | cod | bank_transfer`.
 `pricingTier`: `bulk | standard` — the tier the order was charged at (orders placed before
 tiered pricing are `bulk`). `items[].unitPrice` is what was actually charged.
+`subtotal` = Σ `items[].lineTotal`; `deliveryFee` = delivery charge (0 = free);
+`totalAmount` = `subtotal + deliveryFee` (payable). See **Delivery charge**.
 
 ## Public endpoints
 
-### `GET /products` → `{ "products": Product[], "testMode": false, "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 70 } }`
+### `GET /products` → `{ "products": Product[], "testMode": false, "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75, "deliveryFee": 350, "freeDeliveryMin": 5000 } }`
 Active products only, ordered by `sortOrder, id`. `Cache-Control: public, max-age=10`.
 
 ### `GET /products/{id}` → `Product` (404 if unknown/archived)
@@ -238,18 +254,21 @@ Active products only, ordered by `sortOrder, id`. `Cache-Control: public, max-ag
 ```json
 {
   "idempotencyKey": "uuid-v4 generated once per checkout attempt",
-  "customer": { "name": "…", "phone": "98400 12345", "email": null,
-                "address": "…", "city": "…", "state": "…", "pincode": "600028" },
+  "customer": { "name": "…", "phone": "98400 12345", "email": "…",
+                "address": "…", "city": "…", "state": "Tamil Nadu", "pincode": "600028" },
   "notes": null,
   "items": [ { "productId": "zm-03", "quantity": 10 } ]
 }
 ```
 - 1–50 lines, unique `productId`s, quantity 1–1000. Phone accepts `9840012345`, `+91 98400 12345`,
   `09840012345` → stored as `+919840012345`. Prices are **always** taken from the DB, never the client,
-  and the tier (`bulk` / `standard`, see **Pricing tiers**) is decided from them.
+  and the tier (`bulk` / `standard`, see **Pricing tiers**) and the delivery charge (see
+  **Delivery charge**) are decided from them.
+- `customer.state` is optional: missing, `null` or blank ⇒ `"Tamil Nadu"` (the storefront no
+  longer asks for it). When present it must be 2–80 characters.
 - Atomic: all lines' stock is decremented in one transaction (rows locked in `productId` order to
   avoid deadlocks) with an `order_placed` stock movement per line, or nothing happens.
-- 201 `{ "order": { "orderNumber", "status", "pricingTier", "totalAmount", "mrpTotal", "itemCount", "createdAt", "items": [...] } }`.
+- 201 `{ "order": { "orderNumber", "status", "pricingTier", "subtotal", "deliveryFee", "totalAmount", "mrpTotal", "itemCount", "createdAt", "items": [...] } }`.
   Re-sending the same `idempotencyKey` returns 200 with the original order (no second reservation);
   same key with a different payload → 409 `idempotency_conflict`.
 - Errors: 409 `out_of_stock` (with `details`), 409 `product_unavailable`, 400 `validation_error`, 429.
@@ -297,7 +316,8 @@ Dashboard
   "recentOrders": [Order]
 }
 ```
-  Revenue excludes cancelled orders and refunded payments. `salesByDay` = last 14 IST days (zero-filled),
+  Revenue excludes cancelled orders and refunded payments; it is order totals, so delivery
+  charges are included (`topProducts[].revenue` is line totals: goods only). `salesByDay` = last 14 IST days (zero-filled),
   `topProducts` = top 5 by units over 30 days, `recentOrders` = latest 5, `lowStock` = up to 10, lowest first.
 - `GET /admin/sync` → `{ "ordersVersion": "…", "productsVersion": "…", "pendingOrders": 3, "latestOrderNumber": "ZM-…" }`
   Cheap change marker (max `updated_at` + counts). The admin UI polls this every ~5 s and refetches
@@ -307,8 +327,8 @@ Dashboard
 
 # Payments (Razorpay) & Guest Orders (v1)
 
-Customers never log in. Checkout collects only: name, phone, optional email, address, city,
-state, pincode, optional notes. Payment is online via Razorpay Checkout.
+Customers never log in. Checkout collects only: name, phone, email, address, city,
+pincode, optional state (default "Tamil Nadu"), optional notes. Payment is online via Razorpay Checkout.
 
 **Trust model:** the browser never decides that an order is paid. An order becomes paid only
 after the server (a) verifies the Checkout signature AND confirms the payment with the
@@ -330,7 +350,7 @@ POST /orders ─► pending_payment (stock RESERVED, paymentExpiresAt = now + PA
 `PAYMENT_TEST_MODE=true` ⇒ every product is **charged ₹1 per unit**, enforced server-side:
 public catalog `price` = 1 (real `originalPrice` kept), `GET /products` returns
 `{ "products": [...], "testMode": true }`, orders are created with `isTest: true` and totals at
-₹1 × quantity. `false` ⇒ real prices (production). With `APP_ENV=production` and test mode off,
+₹1 × quantity (+ a ₹1 delivery charge below `freeDeliveryMin`; `pricing.deliveryFee` is 1). `false` ⇒ real prices (production). With `APP_ENV=production` and test mode off,
 live keys (`rzp_live_…`) are required. Test orders are excluded from real revenue figures.
 
 ## Guest order token
@@ -353,27 +373,28 @@ Wrong/missing token ⇒ 404 `not_found` (indistinguishable from an unknown order
 ## Public endpoints
 
 ### `GET /storefront/config`
-`{ "testMode": false, "onlinePaymentsEnabled": true, "razorpayKeyId": "rzp_live_…", "currency": "INR", "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks", "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 70 } }`
+`{ "testMode": false, "onlinePaymentsEnabled": true, "razorpayKeyId": "rzp_live_…", "currency": "INR", "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks", "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75, "deliveryFee": 350, "freeDeliveryMin": 5000 } }`
 (`Cache-Control: public, max-age=60`). The key id is public by design; the secret never leaves the server.
 
 ### `POST /orders` (changed)
-Request unchanged. 201 (replay 200):
+Request unchanged. 201 (replay 200, same values):
 ```json
 {
   "order": { "orderNumber": "ZM-261013-1001", "status": "pending_payment", "paymentExpiresAt": "…",
-             "isTest": false, "pricingTier": "standard", "totalAmount": 1650, "mrpTotal": 3000, "itemCount": 10, "createdAt": "…",
+             "isTest": false, "pricingTier": "standard", "subtotal": 1650, "deliveryFee": 350, "totalAmount": 2000,
+             "mrpTotal": 3000, "itemCount": 10, "createdAt": "…",
              "items": [ … ] },
   "orderToken": "…43 chars…"
 }
 ```
 
 ### `POST /orders/{orderNumber}/pay`  (header `X-Order-Token`)
-Creates the Razorpay order on first call (`amount = total in paise`, `currency INR`,
+Creates the Razorpay order on first call (`amount = totalAmount in paise`, delivery included, `currency INR`,
 `receipt = orderNumber`, `notes.order_id`), reuses it afterwards (Razorpay allows multiple
 attempts per order). 200:
 ```json
 {
-  "keyId": "rzp_live_…", "razorpayOrderId": "order_…", "amountPaise": 165000, "currency": "INR",
+  "keyId": "rzp_live_…", "razorpayOrderId": "order_…", "amountPaise": 200000, "currency": "INR",
   "name": "Zhi-Mart Fireworks", "description": "Order ZM-261013-1001",
   "prefill": { "name": "…", "email": "…|null", "contact": "+919840012345" },
   "notes": { "orderNumber": "ZM-261013-1001" },
@@ -398,7 +419,7 @@ payment is captured via the API). Marks the order paid → `pending_pack`. Idemp
   "pricingTier": "bulk|standard",
   "createdAt": "…", "paymentExpiresAt": "…|null",
   "payment": { "status": "pending|paid|refunded|failed", "instrument": "upi|card|…|null", "paidAt": "…|null" },
-  "totalAmount": 1650, "mrpTotal": 3000, "itemCount": 10, "items": [ … ],
+  "subtotal": 1650, "deliveryFee": 350, "totalAmount": 2000, "mrpTotal": 3000, "itemCount": 10, "items": [ … ],
   "shipping": { "transportPartner": null, "docketNumber": null, "dispatchedAt": null, "deliveredAt": null },
   "customerName": "…", "city": "…" }
 ```
@@ -418,7 +439,7 @@ is the authentication); body ≤ 64 KiB.
 - `GET /admin/orders` excludes `pending_payment` orders unless `status=pending_payment` or `includeUnpaid=true`.
 - `pending_payment` orders cannot be advanced via `/status` (409 `invalid_transition`); they may be cancelled (stock released).
 - Manual `/payment` actions are rejected (409 `invalid_transition`) for `payment.method = "razorpay"`; use refunds.
-- `POST /admin/orders/{id}/refund` `{ "amount": 1650 | null (full remaining), "reason": "…", "expectedVersion": 3 }`
+- `POST /admin/orders/{id}/refund` `{ "amount": 1650 | null (full remaining, delivery charge included), "reason": "…", "expectedVersion": 3 }`
   → Razorpay refund API (idempotent per request) → 200 `Order` (`payment.status = "refunded"` once fully refunded; partial refunds tracked in `amountRefunded`). Errors: 409 `invalid_transition` (not paid / nothing left), 502.
 - `GET /admin/orders/{id}/payment-events` → `{ "events": [{ "id","event","outcome","receivedAt" }], "refunds": [{ "id","razorpayRefundId","amount","status","reason","adminEmail","createdAt" }] }`
 - Dashboard: real revenue excludes `isTest` orders and unpaid (`pending_payment`) orders; adds
@@ -458,7 +479,8 @@ flow and shows "Order received — we'll contact you to confirm payment and disp
 - Content (rendered from current DB data at send time): subject
   `New order ZM-… — ₹X from <customer name>` (prefixed `[TEST] ` for test orders); order number and
   IST date/time; customer name, phone (tap-to-call), email, full address with pincode, notes; item table
-  (product, pack, qty, unit price, line total); MRP total, savings, amount payable; pricing tier
+  (product, pack, qty, unit price, line total); MRP total, savings (on the goods), subtotal,
+  delivery ("₹350" or "FREE"), "Tax (GST): ₹0", amount payable; pricing tier
   ("Bulk price (₹10,000+ order)" / "Standard price (order below ₹10,000)"); payment method/status
   (and Razorpay payment id when paid online); a button linking to the admin console
   (`PUBLIC_SITE_URL` + `/?page=admin`, omitted if unset). Every value is HTML-escaped.
@@ -480,7 +502,8 @@ flow and shows "Order received — we'll contact you to confirm payment and disp
   `Your Zhi-Mart order ZM-… is confirmed` (`[TEST] ` prefix for test orders).
 - Content: greeting with the customer's name; order number + IST time; prominent **"Track your order"** button
   (plus the raw link for clients that block buttons) with a note to keep the link private; items
-  (product, pack, qty, unit price, line total); MRP total, savings, total, pricing tier line; payment section — pay-later:
+  (product, pack, qty, unit price, line total); MRP total, savings (on the goods), subtotal, delivery ("₹350" or
+  "FREE"), "Tax (GST): ₹0", total, pricing tier line; payment section — pay-later:
   "Our team will call you on +91 ••••• •1234 to confirm payment and dispatch", online: "Payment of ₹X received via UPI";
   delivery address; support line (WhatsApp/phone of the store if configured, otherwise "reply to this email"
   is NOT promised — no reply handling exists). Every value HTML-escaped; plain-text alternative.

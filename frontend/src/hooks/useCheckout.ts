@@ -11,6 +11,7 @@ import {
   PricingTier,
 } from '../lib/ordersApi';
 import { computeTotals } from '../lib/money';
+import { burstCrackers } from '../lib/crackerPop';
 import { CheckoutField, CheckoutFormValues, mapServerValidation, toOrderCustomer } from '../lib/checkout';
 import { CartItem } from '../types';
 import { PRODUCTS_QUERY_KEY, usePricingRules } from './useProducts';
@@ -196,6 +197,12 @@ export function useCheckout() {
         };
         attemptRef.current = null; // the next checkout gets a fresh key
         setSuccess(result);
+        // Celebrate the placement once, here — never on later visits/refreshes of the order page.
+        try {
+          burstCrackers({ intensity: 'celebration' });
+        } catch {
+          // Purely decorative; never let it affect checkout.
+        }
         void refreshProducts();
         return result;
       } catch (err) {

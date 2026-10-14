@@ -322,10 +322,10 @@ Two price tiers, decided per order, server-side:
   MRP) is at least `BULK_MIN_ORDER_RUPEES` (default ₹10,000; exactly ₹10,000 counts).
   Every line is charged its list price.
 - **Standard.** Below that minimum, **every** line is charged the standard price:
-  MRP × (100 − `STANDARD_DISCOUNT_PERCENT`) / 100 (default 70 % off), rounded **up** to
+  MRP × (100 − `STANDARD_DISCOUNT_PERCENT`) / 100 (default 75 % off), rounded **up** to
   a whole rupee, never below the list price and never above the MRP. Example: MRP ₹210,
-  list ₹32 → standard ₹63; MRP ₹550 → ₹165. A product discounted less than 70 % (or
-  without an MRP) costs its list price in both tiers.
+  list ₹32 → standard ₹53 (₹52.50 rounded up); MRP ₹200 → ₹50. A product discounted
+  less than 75 % (or without an MRP) costs its list price in both tiers.
 
 The tier is decided on list prices, so a ₹9,990 list-price cart pays standard prices
 (which may come to more than ₹10,000) and adding one more item can lower the bill. The
@@ -340,6 +340,33 @@ from real list prices, but every unit is charged ₹1.
 
 Changing these settings affects new orders only; existing orders keep the prices they were
 placed at.
+
+### Delivery charge
+
+After tier pricing, the goods total is the order's **subtotal**. An order whose subtotal
+is below `FREE_DELIVERY_MIN_RUPEES` (default ₹5,000) pays a flat `DELIVERY_FEE_RUPEES`
+(default ₹350); from ₹5,000 (inclusive) delivery is free. `FREE_DELIVERY_MIN_RUPEES=0`
+makes delivery always free; `DELIVERY_FEE_RUPEES=0` does too.
+
+- The server decides the fee; the client never sends it. It is stored per order in
+  `orders.delivery_fee_paise` (orders placed before this feature have 0).
+- `orders.total_paise` = sum of the line totals + `delivery_fee_paise`. It stays the
+  payable amount, so the Razorpay amount, payment verification, refunds (a full refund
+  returns the delivery charge too), manual "mark paid" and dashboard revenue all include
+  delivery. Top-product revenue is line totals, so it excludes it.
+- Order JSON carries `subtotal`, `deliveryFee` and `totalAmount`; `GET /products` and
+  `GET /storefront/config` publish `pricing.deliveryFee` and `pricing.freeDeliveryMin`.
+- Both order emails show Subtotal, Delivery ("₹350" or "FREE"), "Tax (GST): ₹0" (prices
+  are tax-inclusive) and the total. Savings are computed on the goods only.
+- Under `PAYMENT_TEST_MODE` the delivery charge is ₹1 (like every unit), applied when the
+  ₹1-per-unit subtotal is below the free-delivery minimum.
+- Because a small order plus delivery can cost more than its MRP, the database checks
+  `mrp_total_paise >= total_paise - delivery_fee_paise` (goods only).
+
+### Checkout address
+
+The store delivers within Tamil Nadu only, so the storefront no longer asks for a state.
+`customer.state` is optional on `POST /orders`; missing or blank means "Tamil Nadu".
 
 ## Customer order confirmation emails
 
@@ -359,7 +386,8 @@ checkout.
     token sits in the URL fragment, so it never reaches servers, logs or `Referer`.
     The email warns: "keep this link private — anyone with it can see your order
     status".
-  - Items, MRP total, savings and total, then the delivery address.
+  - Items, MRP total, savings, subtotal, delivery ("₹350" or "FREE"), "Tax (GST): ₹0"
+    and total, then the delivery address.
   - Payment section:
     - Pay-later: "Our team will call you on +91 ••••• •1234…". The phone is masked to
       its last 4 digits.
@@ -396,7 +424,8 @@ checkout.
   - Subject `New order ZM-… — ₹X from <customer>`, prefixed `[TEST] ` for test orders.
   - Order number and time in IST.
   - Customer details: name, tap-to-call phone, email, address with pincode, notes.
-  - An item table with MRP, savings and the amount payable.
+  - An item table with MRP, savings, subtotal, delivery ("₹350" or "FREE"),
+    "Tax (GST): ₹0" and the amount payable.
   - Payment method and status, plus the Razorpay payment id when paid online.
   - An **Open admin console** button pointing at `PUBLIC_SITE_URL/?page=admin` (only
     when that is set).
@@ -460,6 +489,7 @@ payments from sitting uncaptured and being auto-refunded by Razorpay.
 `PAYMENT_TEST_MODE=true` charges **₹1 per unit for every product**. This is enforced
 server-side:
 - The storefront shows `testMode`, and the real MRP is kept for display.
+- The delivery charge (when it applies) is ₹1 too; `pricing.deliveryFee` reports 1.
 - Orders are flagged `isTest` and excluded from revenue on the dashboard.
 
 | Keys | `PAYMENT_TEST_MODE` | Result |

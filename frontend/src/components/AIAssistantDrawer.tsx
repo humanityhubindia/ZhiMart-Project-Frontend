@@ -68,7 +68,7 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
   });
   const recommendedProducts = recommendedLines.map((l) => l.product);
   const totals = computeTotals(recommendedLines, rules);
-  const totalRecommendedPrice = totals.total;
+  const totalRecommendedPrice = totals.subtotal;
   const tierNote = testMode ? '' : planTierNote(totals, limit);
 
   return (

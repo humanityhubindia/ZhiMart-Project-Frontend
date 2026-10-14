@@ -250,6 +250,19 @@ fn html_multiline(text: &str) -> String {
     escape_html(text.trim()).replace('\n', "<br>")
 }
 
+/// "₹350", or "FREE" when the order ships free.
+pub fn delivery_label(delivery_fee_paise: i64) -> String {
+    if delivery_fee_paise > 0 {
+        format_inr(delivery_fee_paise)
+    } else {
+        "FREE".to_owned()
+    }
+}
+
+/// GST line on order summaries: prices are inclusive, nothing is added.
+const TAX_LABEL: &str = "Tax (GST)";
+const TAX_AMOUNT: &str = "₹0";
+
 /// "Bulk price (₹10,000+ order)" / "Standard price (order below ₹10,000)".
 /// `bulk_min_order_paise` is the currently configured minimum.
 pub fn pricing_tier_label(tier: &str, bulk_min_order_paise: i64) -> String {
@@ -274,8 +287,11 @@ pub fn order_notification(
     let subject_name: String = name_text.chars().take(MAX_SUBJECT_NAME_CHARS).collect();
     let test_prefix = if order.is_test { "[TEST] " } else { "" };
     let total = format_inr(order.total_amount);
+    let subtotal = format_inr(order.subtotal);
+    let delivery = delivery_label(order.delivery_fee);
     let mrp = format_inr(order.mrp_total);
-    let savings = format_inr((order.mrp_total - order.total_amount).max(0));
+    // Savings are on the goods; the delivery charge is not discounted.
+    let savings = format_inr((order.mrp_total - order.subtotal).max(0));
     let pricing = pricing_tier_label(&order.pricing_tier, bulk_min_order_paise);
     let order_number = sanitize_text(&order.order_number);
     let placed_at = ist(order.created_at);
@@ -346,6 +362,9 @@ pub fn order_notification(
     }
     let _ = writeln!(text, "\nMRP total:      {mrp}");
     let _ = writeln!(text, "Savings:        {savings}");
+    let _ = writeln!(text, "Subtotal:       {subtotal}");
+    let _ = writeln!(text, "Delivery:       {delivery}");
+    let _ = writeln!(text, "{TAX_LABEL}:      {TAX_AMOUNT}");
     let _ = writeln!(text, "Amount payable: {total}");
     let _ = writeln!(text, "Pricing:        {pricing}\n");
     let _ = writeln!(text, "PAYMENT");
@@ -474,6 +493,9 @@ pub fn order_notification(
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="font-family:Segoe UI,Helvetica,Arial,sans-serif;margin-top:8px;">
 <tr><td style="padding:3px 0;color:#94a3b8;font-size:13px;">MRP total</td><td style="padding:3px 0;color:#94a3b8;font-size:13px;text-align:right;text-decoration:line-through;">{mrp_html}</td></tr>
 <tr><td style="padding:3px 0;color:#86efac;font-size:13px;">Savings</td><td style="padding:3px 0;color:#86efac;font-size:13px;text-align:right;">{savings_html}</td></tr>
+<tr><td style="padding:3px 0;color:#e2e8f0;font-size:13px;">Subtotal</td><td style="padding:3px 0;color:#e2e8f0;font-size:13px;text-align:right;">{subtotal_html}</td></tr>
+<tr><td style="padding:3px 0;color:#e2e8f0;font-size:13px;">Delivery</td><td style="padding:3px 0;color:#e2e8f0;font-size:13px;text-align:right;">{delivery_html}</td></tr>
+<tr><td style="padding:3px 0;color:#e2e8f0;font-size:13px;">{tax_label}</td><td style="padding:3px 0;color:#e2e8f0;font-size:13px;text-align:right;">{tax_amount}</td></tr>
 <tr><td style="padding:6px 0;color:#f8fafc;font-size:15px;font-weight:700;">Amount payable</td><td style="padding:6px 0;color:#fbbf24;font-size:15px;font-weight:700;text-align:right;">{total_html}</td></tr>
 <tr><td style="padding:3px 0;color:#94a3b8;font-size:13px;">Pricing</td><td style="padding:3px 0;color:#94a3b8;font-size:13px;text-align:right;">{pricing_html}</td></tr>
 </table>
@@ -499,6 +521,10 @@ Automated notification from {brand}. Customer details are confidential — do no
         placed_html = escape_html(&placed_at),
         mrp_html = escape_html(&mrp),
         savings_html = escape_html(&savings),
+        subtotal_html = escape_html(&subtotal),
+        delivery_html = escape_html(&delivery),
+        tax_label = escape_html(TAX_LABEL),
+        tax_amount = escape_html(TAX_AMOUNT),
         pricing_html = escape_html(&pricing),
         brand = escape_html(BRAND),
     );
@@ -570,8 +596,11 @@ pub fn customer_order_confirmation(order: &Order, config: &Config) -> Option<Out
     let order_number = sanitize_text(&order.order_number);
     let placed_at = ist(order.created_at);
     let total = format_inr(order.total_amount);
+    let subtotal = format_inr(order.subtotal);
+    let delivery = delivery_label(order.delivery_fee);
     let mrp = format_inr(order.mrp_total);
-    let savings_paise = (order.mrp_total - order.total_amount).max(0);
+    // Savings are on the goods; the delivery charge is not discounted.
+    let savings_paise = (order.mrp_total - order.subtotal).max(0);
     let savings = format_inr(savings_paise);
     let pricing = pricing_tier_label(&order.pricing_tier, config.pricing.bulk_min_order_paise);
     let store = sanitize_text(config.store_name.trim());
@@ -626,6 +655,9 @@ pub fn customer_order_confirmation(order: &Order, config: &Config) -> Option<Out
     if savings_paise > 0 {
         let _ = writeln!(text, "You save:  {savings}");
     }
+    let _ = writeln!(text, "Subtotal:  {subtotal}");
+    let _ = writeln!(text, "Delivery:  {delivery}");
+    let _ = writeln!(text, "{TAX_LABEL}: {TAX_AMOUNT}");
     let _ = writeln!(text, "Total:     {total}");
     let _ = writeln!(text, "Pricing:   {pricing}\n");
     let _ = writeln!(text, "PAYMENT\n  {payment_line}\n");
@@ -717,6 +749,9 @@ If the button doesn't work, open this link:<br><a href="{href}" style="color:#fb
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:8px;">
 <tr><td style="padding:4px 0;font-size:14px;color:#94a3b8;{FONT}">MRP total</td><td style="padding:4px 0;font-size:14px;color:#94a3b8;text-align:right;text-decoration:line-through;{FONT}">{mrp_html}</td></tr>
 {savings_row}
+<tr><td style="padding:4px 0;font-size:14px;color:#e2e8f0;{FONT}">Subtotal</td><td style="padding:4px 0;font-size:14px;color:#e2e8f0;text-align:right;{FONT}">{subtotal_html}</td></tr>
+<tr><td style="padding:4px 0;font-size:14px;color:#e2e8f0;{FONT}">Delivery</td><td style="padding:4px 0;font-size:14px;color:#e2e8f0;text-align:right;{FONT}">{delivery_html}</td></tr>
+<tr><td style="padding:4px 0;font-size:14px;color:#e2e8f0;{FONT}">{tax_label}</td><td style="padding:4px 0;font-size:14px;color:#e2e8f0;text-align:right;{FONT}">{tax_amount}</td></tr>
 <tr><td style="padding:8px 0;font-size:18px;font-weight:700;color:#f8fafc;{FONT}">Total</td><td style="padding:8px 0;font-size:18px;font-weight:700;color:#fbbf24;text-align:right;{FONT}">{total_html}</td></tr>
 <tr><td colspan="2" style="padding:2px 0;font-size:14px;color:#94a3b8;{FONT}">Pricing: {pricing_html}</td></tr>
 </table>
@@ -746,6 +781,10 @@ This is an automated message from {store_html}; this mailbox is not monitored.
         placed_html = escape_html(&placed_at),
         privacy_html = escape_html(PRIVACY),
         mrp_html = escape_html(&mrp),
+        subtotal_html = escape_html(&subtotal),
+        delivery_html = escape_html(&delivery),
+        tax_label = escape_html(TAX_LABEL),
+        tax_amount = escape_html(TAX_AMOUNT),
         pricing_html = escape_html(&pricing),
         payment_html = escape_html(&payment_line),
     );
@@ -873,6 +912,8 @@ mod tests {
             ],
             item_count: 4,
             mrp_total: 20_090_000,
+            subtotal: 12_395_150,
+            delivery_fee: 0,
             total_amount: 12_395_150,
             status: "pending_pack".into(),
             payment: Payment {
@@ -940,7 +981,12 @@ mod tests {
             assert!(body.contains("Online (Razorpay)"));
             assert!(body.contains("Bulk price (₹10,000+ order)"), "pricing tier");
             assert!(body.contains("626123"));
+            assert!(body.contains("Subtotal") && body.contains("₹1,23,951.50"));
+            assert!(body.contains("FREE"), "free delivery");
+            assert!(body.contains("Tax (GST)") && body.contains("₹0"));
         }
+        assert!(e.text.contains("Delivery:       FREE"));
+        assert!(e.text.contains("Tax (GST):      ₹0"));
         assert!(e.text.contains("https://zhimart.com/?page=admin"));
         let href = format!(
             r#"href="{}""#,
@@ -953,6 +999,44 @@ mod tests {
         assert!(e.html.contains(r#"href="tel:+919840012345""#));
         assert!(e.html.contains("Open admin console"));
         assert!(!e.html.contains("<img") && !e.html.contains("http://"));
+    }
+
+    /// A small standard-tier order: ₹495 of goods + ₹350 delivery.
+    fn small_order() -> Order {
+        let mut o = order(false);
+        o.items.truncate(1);
+        o.item_count = 3;
+        o.mrp_total = 90_000;
+        o.subtotal = 49_500;
+        o.delivery_fee = 35_000;
+        o.total_amount = 84_500;
+        o.pricing_tier = "standard".into();
+        o.customer.email = Some("ravi@example.com".into());
+        o
+    }
+
+    #[test]
+    fn order_emails_show_subtotal_delivery_tax_and_total() {
+        let o = small_order();
+        let admin = order_notification(&o, vec!["a@b.co".into()], None, 1_000_000);
+        let customer = customer_order_confirmation(&o, &cfg()).expect("rendered");
+        for body in [&admin.html, &admin.text, &customer.html, &customer.text] {
+            assert!(body.contains("₹495"), "subtotal");
+            assert!(body.contains("₹350"), "delivery fee");
+            assert!(body.contains("₹845"), "total incl. delivery");
+            assert!(body.contains("₹405"), "savings on goods only (₹900 − ₹495)");
+            assert!(body.contains("Tax (GST)"));
+            assert!(!body.contains("FREE"));
+        }
+        assert!(admin.subject.contains("₹845"));
+        assert!(admin.text.contains("Subtotal:       ₹495"));
+        assert!(admin.text.contains("Delivery:       ₹350"));
+        assert!(admin.text.contains("Amount payable: ₹845"));
+        assert!(customer.text.contains("Subtotal:  ₹495"));
+        assert!(customer.text.contains("Delivery:  ₹350"));
+        assert!(customer.text.contains("Tax (GST): ₹0"));
+        assert!(customer.text.contains("Total:     ₹845"));
+        assert!(customer.text.contains("Payment of ₹845 received via UPI"));
     }
 
     #[test]
@@ -1061,6 +1145,10 @@ mod tests {
             assert!(body.contains("₹2,00,900"), "MRP");
             assert!(body.contains("PIN 626123"));
             assert!(body.contains("Payment of ₹1,23,951.50 received via UPI"));
+            assert!(
+                body.contains("Subtotal") && body.contains("FREE"),
+                "free delivery"
+            );
             assert!(body.contains("Bulk price (₹10,000+ order)"), "pricing tier");
             assert!(!body.contains("9840012345"), "full phone never shown");
             assert!(

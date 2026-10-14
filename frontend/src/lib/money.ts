@@ -21,7 +21,10 @@ export const formatRupees = (rupees: number) => formatter.format(Number(rupees) 
  * Two-tier pricing (served by `GET /products` as `pricing`, see backend/API.md):
  * when the cart adds up to at least `bulkMinOrder` at price-list (`price`) prices, every line is
  * charged at `price` (~85% off MRP); below that, every line is charged at `standardPrice`
- * (~70% off). The server applies the same rule when the order is placed.
+ * (~75% off). The server applies the same rule when the order is placed.
+ *
+ * Delivery: orders whose payable goods value (`subtotal`, after tier pricing) is below
+ * `freeDeliveryMin` pay a flat `deliveryFee`; at or above it delivery is free. No tax (₹0 GST).
  */
 export interface PricingRules {
   /** Minimum cart total, at price-list prices, that unlocks the bulk price (rupees). */
@@ -29,13 +32,26 @@ export interface PricingRules {
   /** Label-only: the headline discounts of each tier. */
   bulkDiscountPercent: number;
   standardDiscountPercent: number;
+  /** Flat delivery charge (rupees) for orders below `freeDeliveryMin`. */
+  deliveryFee: number;
+  /** Subtotal (rupees, after tier pricing) from which delivery is free (inclusive). 0 = always free. */
+  freeDeliveryMin: number;
 }
 
 export const DEFAULT_PRICING: PricingRules = {
   bulkMinOrder: 10000,
   bulkDiscountPercent: 85,
-  standardDiscountPercent: 70,
+  standardDiscountPercent: 75,
+  deliveryFee: 350,
+  freeDeliveryMin: 5000,
 };
+
+/** False when delivery is always free (`freeDeliveryMin` 0 or no fee). */
+export const hasDeliveryCharge = (rules: PricingRules) => rules.freeDeliveryMin > 0 && rules.deliveryFee > 0;
+
+/** Delivery charge for a goods subtotal (rupees): 0 when empty or at/above `freeDeliveryMin`. */
+export const deliveryFeeFor = (subtotal: number, rules: PricingRules) =>
+  subtotal > 0 && hasDeliveryCharge(rules) && subtotal < rules.freeDeliveryMin ? rules.deliveryFee : 0;
 
 /** False when there is no minimum (`bulkMinOrder` 0): every order gets the bulk price, nothing to unlock. */
 export const hasBulkThreshold = (rules: PricingRules) => rules.bulkMinOrder > 0;
@@ -47,12 +63,19 @@ export const unitPriceFor = (product: PricedProduct, bulkUnlocked: boolean) =>
   bulkUnlocked ? product.price : (product.standardPrice ?? product.price);
 
 export interface CartTotals {
-  /** Amount payable: `listTotal` when the bulk tier is unlocked, else `standardTotal`. */
+  /** Goods payable after tier pricing: `listTotal` when the bulk tier is unlocked, else `standardTotal`. */
+  subtotal: number;
+  /** Delivery charge on top of `subtotal` (0 when free or the cart is empty). */
+  deliveryFee: number;
+  /** Subtotal still needed for free delivery (0 once free, when empty, or when delivery is always free). */
+  amountToFreeDelivery: number;
+  /** Amount payable: `subtotal + deliveryFee` (tax is ₹0). */
   total: number;
   mrpTotal: number;
+  /** MRP savings on goods (`mrpTotal - subtotal`); the delivery fee is not counted against it. */
   savings: number;
   units: number;
-  /** Effective discount across the cart, rounded. */
+  /** Effective discount across the goods (vs MRP), rounded. */
   discountPercent: number;
   /** Cart at price-list (bulk) prices — this is what is compared with `bulkMinOrder`. */
   listTotal: number;
@@ -77,9 +100,13 @@ export function computeTotals(
     items.map((i) => lineTotal(unitPriceFor(i.product, false), i.quantity))
   );
   const bulkUnlocked = listTotal > 0 && listTotal >= rules.bulkMinOrder;
-  const total = bulkUnlocked ? listTotal : standardTotal;
+  const subtotal = bulkUnlocked ? listTotal : standardTotal;
+  const deliveryFee = deliveryFeeFor(subtotal, rules);
+  const amountToFreeDelivery =
+    deliveryFee > 0 ? Math.max(0, sumRupees([rules.freeDeliveryMin, -subtotal])) : 0;
+  const total = sumRupees([subtotal, deliveryFee]);
   const mrpTotal = sumRupees(items.map((i) => lineTotal(i.product.originalPrice, i.quantity)));
-  const savings = Math.max(0, sumRupees([mrpTotal, -total]));
+  const savings = Math.max(0, sumRupees([mrpTotal, -subtotal]));
   const units = items.reduce((acc, i) => acc + i.quantity, 0);
   const discountPercent = mrpTotal > 0 ? Math.round((savings / mrpTotal) * 100) : 0;
   const amountToUnlock =
@@ -88,6 +115,9 @@ export function computeTotals(
     rules.bulkMinOrder > 0 ? Math.min(1, Math.max(0, listTotal / rules.bulkMinOrder)) : 1;
   const bulkSavings = Math.max(0, sumRupees([standardTotal, -listTotal]));
   return {
+    subtotal,
+    deliveryFee,
+    amountToFreeDelivery,
     total,
     mrpTotal,
     savings,
@@ -101,4 +131,27 @@ export function computeTotals(
     bulkSavings,
     rules,
   };
+}
+
+/** Shown under the totals: there is no tax on orders (₹0 GST). */
+export const NO_TAX_NOTE = 'No tax · ₹0 GST';
+
+/** "Add ₹X more for FREE delivery (free on orders ₹5,000+)", or null when delivery is already free. */
+export function freeDeliveryHint(totals: Pick<CartTotals, 'deliveryFee' | 'amountToFreeDelivery' | 'rules'>): string | null {
+  if (totals.deliveryFee <= 0 || totals.amountToFreeDelivery <= 0) return null;
+  return `Add ₹${formatRupees(totals.amountToFreeDelivery)} more for FREE delivery (free on orders ₹${formatRupees(
+    totals.rules.freeDeliveryMin
+  )}+)`;
+}
+
+/**
+ * Billing split of a placed order. `totalAmount` already includes the delivery fee; orders placed
+ * before delivery charges have no `subtotal`/`deliveryFee` and are treated as fee 0.
+ */
+export function orderCharges(order: { totalAmount: number; subtotal?: number | null; deliveryFee?: number | null }) {
+  const fee = Number(order.deliveryFee ?? 0);
+  const deliveryFee = Number.isFinite(fee) && fee > 0 ? fee : 0;
+  const sub = order.subtotal == null ? NaN : Number(order.subtotal);
+  const subtotal = Number.isFinite(sub) ? sub : sumRupees([order.totalAmount, -deliveryFee]);
+  return { subtotal, deliveryFee, total: order.totalAmount };
 }

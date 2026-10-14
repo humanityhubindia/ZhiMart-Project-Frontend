@@ -3,7 +3,7 @@ import { X, Calculator, Plus, Minus, Check, ShoppingBag } from 'lucide-react';
 import { CrackerProduct } from '../types';
 import { useProducts, useTestMode, usePricingRules } from '../hooks/useProducts';
 import { computeTotals, formatRupees, hasBulkThreshold, lineTotal, unitPriceFor } from '../lib/money';
-import { BulkTierSummary, TierRate, tierSubtitle } from './QuickEstimatePage';
+import { BulkTierSummary, deliveryNote, TierRate, tierSubtitle } from './QuickEstimatePage';
 import { StockBadge } from './StockBadge';
 import { CatalogErrorCard, EmptyCatalogState, ListSkeleton, errorMessage } from './CatalogStates';
 
@@ -43,7 +43,8 @@ export const QuickEstimateModal: React.FC<QuickEstimateModalProps> = ({
 
   const totals = computeTotals(selectedItems, rules);
   const {
-    total: totalEstimate,
+    // Goods value only; delivery is added at checkout (see the delivery note below).
+    subtotal: totalEstimate,
     mrpTotal: totalOriginal,
     savings: totalSavings,
     discountPercent,
@@ -201,6 +202,7 @@ export const QuickEstimateModal: React.FC<QuickEstimateModalProps> = ({
                 ? 'Test mode — every unit is charged ₹1'
                 : `You Save: ₹${formatRupees(totalSavings)} (${discountPercent}% Festival Savings)`}
             </p>
+            {deliveryNote(totals) && <p className="text-[11px] font-semibold text-slate-500">{deliveryNote(totals)}</p>}
             {!testMode && <BulkTierSummary totals={totals} />}
           </div>
 

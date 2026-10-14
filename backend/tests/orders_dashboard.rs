@@ -415,7 +415,9 @@ async fn order_decrements_stock_and_uses_db_prices(pool: PgPool) {
         "expiry = now() + PAYMENT_EXPIRY on the DB clock"
     );
     assert_eq!(o["itemCount"], 13);
-    assert_eq!(o["totalAmount"].as_f64(), Some(1801.5)); // 10 × 165 + 3 × 50.50
+    assert_eq!(o["subtotal"].as_f64(), Some(1801.5)); // 10 × 165 + 3 × 50.50
+    assert_eq!(o["deliveryFee"], 350, "below ₹5,000 ⇒ delivery charged");
+    assert_eq!(o["totalAmount"].as_f64(), Some(2151.5));
     assert_eq!(o["mrpTotal"].as_f64(), Some(3300.0));
     let items = o["items"].as_array().expect("items");
     assert_eq!(items.len(), 2);
@@ -462,7 +464,7 @@ async fn order_decrements_stock_and_uses_db_prices(pool: PgPool) {
     assert_eq!(name, "Ravi Kumar");
     assert_eq!(phone, "+919840012345");
     assert_eq!(item_count, 13);
-    assert_eq!(total, 180_150);
+    assert_eq!(total, 215_150, "goods + delivery");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1019,8 +1021,11 @@ async fn get_by_id_or_number(pool: PgPool) {
         o["shipping"],
         json!({"transportPartner": null, "docketNumber": null, "dispatchedAt": null, "deliveredAt": null})
     );
-    assert_eq!(o["totalAmount"].as_f64(), Some(1650.0));
+    assert_eq!(o["subtotal"].as_f64(), Some(1650.0));
+    assert_eq!(o["deliveryFee"].as_f64(), Some(350.0));
+    assert_eq!(o["totalAmount"].as_f64(), Some(2000.0));
     assert_eq!(o["mrpTotal"].as_f64(), Some(3000.0));
+    assert_eq!(o["customer"]["state"], "Tamil Nadu");
     assert_eq!(o["cancelledAt"], Value::Null);
 
     let by_number = h
@@ -1368,15 +1373,18 @@ async fn dashboard_numbers(pool: PgPool) {
     add_product(&h.pool, "zm-out", 1_000, 2_000, 0, true).await;
     add_product(&h.pool, "zm-old", 1_000, 2_000, 0, false).await;
 
-    let o1 = h.place(&phone(1), &[("zm-01", 10)]).await; // today, paid: 1650
-    let o2 = h.place(&phone(2), &[("zm-02", 2)]).await; // yesterday 23:30 IST, offline pending: 101
-    let o3 = h.place(&phone(3), &[("zm-01", 1)]).await; // 10 days ago, paid: 165
-    let o4 = h.place(&phone(4), &[("zm-01", 2)]).await; // 40 days ago, paid: 330
+    // Every order here is below ₹5,000, so each total includes the ₹350
+    // delivery charge (`FEE`): revenue is what was charged, delivery included.
+    const FEE: f64 = 350.0;
+    let o1 = h.place(&phone(1), &[("zm-01", 10)]).await; // today, paid: 1650 + FEE
+    let o2 = h.place(&phone(2), &[("zm-02", 2)]).await; // yesterday 23:30 IST, offline pending: 101 + FEE
+    let o3 = h.place(&phone(3), &[("zm-01", 1)]).await; // 10 days ago, paid: 165 + FEE
+    let o4 = h.place(&phone(4), &[("zm-01", 2)]).await; // 40 days ago, paid: 330 + FEE
     let o5 = h.place_unpaid(&phone(5), &[("zm-02", 1)]).await; // cancelled (excluded)
     let o6 = h.place(&phone(6), &[("zm-01", 1)]).await; // 3 days ago, fully refunded: 0
-    let o7 = h.place(&phone(7), &[("zm-01", 2)]).await; // 5 days ago, ₹100 refunded: 230 net
-    let o8 = h.place(&phone(8), &[("zm-02", 1)]).await; // test order: 50.5 (test block only)
-    let _o9 = h.place_unpaid(&phone(9), &[("zm-02", 3)]).await; // unpaid: 151.5 (unpaid block only)
+    let o7 = h.place(&phone(7), &[("zm-01", 2)]).await; // 5 days ago, ₹100 refunded: 230 + FEE net
+    let o8 = h.place(&phone(8), &[("zm-02", 1)]).await; // test order: 50.5 + FEE (test block only)
+    let _o9 = h.place_unpaid(&phone(9), &[("zm-02", 3)]).await; // unpaid: 151.5 + FEE (unpaid block only)
 
     let r = h
         .admin_post(
@@ -1460,19 +1468,21 @@ async fn dashboard_numbers(pool: PgPool) {
     let d = &r.body;
     let rupees = |v: &Value| v.as_f64().expect("number");
 
-    assert_eq!(rupees(&d["revenue"]["today"]), 1650.0);
-    assert_eq!(rupees(&d["revenue"]["last7Days"]), 1650.0 + 101.0 + 230.0);
-    assert_eq!(rupees(&d["revenue"]["last30Days"]), 1981.0 + 165.0);
-    assert_eq!(rupees(&d["revenue"]["allTime"]), 2146.0 + 330.0);
+    let last7 = (1650.0 + FEE) + (101.0 + FEE) + (230.0 + FEE);
+    let last30 = last7 + (165.0 + FEE);
+    assert_eq!(rupees(&d["revenue"]["today"]), 1650.0 + FEE);
+    assert_eq!(rupees(&d["revenue"]["last7Days"]), last7);
+    assert_eq!(rupees(&d["revenue"]["last30Days"]), last30);
+    assert_eq!(rupees(&d["revenue"]["allTime"]), last30 + (330.0 + FEE));
     assert_eq!(
         rupees(&d["revenue"]["paid"]),
-        1650.0 + 165.0 + 330.0 + 230.0
+        1650.0 + 165.0 + 330.0 + 230.0 + 4.0 * FEE
     );
-    assert_eq!(rupees(&d["revenue"]["pendingCollection"]), 101.0);
+    assert_eq!(rupees(&d["revenue"]["pendingCollection"]), 101.0 + FEE);
     assert_eq!(d["test"]["orders"], 1);
-    assert_eq!(rupees(&d["test"]["revenue"]), 50.5);
+    assert_eq!(rupees(&d["test"]["revenue"]), 50.5 + FEE);
     assert_eq!(d["unpaid"]["orders"], 1);
-    assert_eq!(rupees(&d["unpaid"]["amount"]), 151.5);
+    assert_eq!(rupees(&d["unpaid"]["amount"]), 151.5 + FEE);
 
     assert_eq!(d["orders"]["total"], 9);
     assert_eq!(d["orders"]["today"], 4); // o1, cancelled o5, test o8, unpaid o9
@@ -1517,20 +1527,21 @@ async fn dashboard_numbers(pool: PgPool) {
         1,
         "test, unpaid and cancelled orders are not sales"
     );
-    assert_eq!(rupees(&day(0)["revenue"]), 1650.0);
+    assert_eq!(rupees(&day(0)["revenue"]), 1650.0 + FEE);
     assert_eq!(day(1)["orders"], 1);
-    assert_eq!(rupees(&day(1)["revenue"]), 101.0);
+    assert_eq!(rupees(&day(1)["revenue"]), 101.0 + FEE);
     assert_eq!(day(3)["orders"], 1); // refunded order still counts as an order...
     assert_eq!(rupees(&day(3)["revenue"]), 0.0); // ...but not as revenue
-    assert_eq!(rupees(&day(5)["revenue"]), 230.0); // net of the partial refund
-    assert_eq!(rupees(&day(10)["revenue"]), 165.0);
+    assert_eq!(rupees(&day(5)["revenue"]), 230.0 + FEE); // net of the partial refund
+    assert_eq!(rupees(&day(10)["revenue"]), 165.0 + FEE);
     assert_eq!(day(2)["orders"], 0);
     let total_rev: f64 = days.iter().map(|p| rupees(&p["revenue"])).sum();
-    assert_eq!(total_rev, 2146.0);
+    assert_eq!(total_rev, last30);
 
     assert_eq!(
         d["topProducts"],
         json!([
+            // Line totals: goods only, no delivery charge.
             {"productId": "zm-01", "name": "Product zm-01", "unitsSold": 13, "revenue": 2145},
             {"productId": "zm-02", "name": "Product zm-02", "unitsSold": 2, "revenue": 101},
         ])
@@ -1622,7 +1633,9 @@ async fn test_mode_charges_one_rupee_per_unit(pool: PgPool) {
     let o = &r.body["order"];
     assert_eq!(o["isTest"], true);
     assert_eq!(o["status"], "pending_payment");
-    assert_eq!(o["totalAmount"], 12); // ₹1 × 12 units
+    assert_eq!(o["subtotal"], 12); // ₹1 × 12 units
+    assert_eq!(o["deliveryFee"], 1, "test mode: delivery charged at ₹1 too");
+    assert_eq!(o["totalAmount"], 13);
     assert_eq!(o["mrpTotal"], 3000 + 2); // real MRP kept, floored at ₹1
     assert_eq!(o["items"][0]["unitPrice"], 1);
     assert_eq!(o["items"][0]["unitMrp"], 300);
@@ -1638,14 +1651,14 @@ async fn test_mode_charges_one_rupee_per_unit(pool: PgPool) {
         .await
         .expect("row");
     assert!(is_test);
-    assert_eq!(total, 1_200);
+    assert_eq!(total, 1_300);
 }
 
 // ---------------------------------------------------------------------------
-// Two-tier pricing (bulk ≥ ₹10,000 at list prices, else standard = 70 % off MRP)
+// Two-tier pricing (bulk ≥ ₹10,000 at list prices, else standard = 75 % off MRP)
 // ---------------------------------------------------------------------------
 
-/// ₹32 list / ₹210 MRP (standard ₹63) and ₹1,000 list / ₹5,000 MRP (standard ₹1,500).
+/// ₹32 list / ₹210 MRP (standard ₹53) and ₹1,000 list / ₹5,000 MRP (standard ₹1,250).
 async fn add_tier_products(pool: &PgPool) {
     add_product(pool, "zm-a", 3_200, 21_000, 1_000, true).await;
     add_product(pool, "zm-b", 100_000, 500_000, 100, true).await;
@@ -1679,27 +1692,37 @@ async fn small_order_is_charged_standard_prices(pool: PgPool) {
     let (o, admin) = place_priced(&h, Uuid::new_v4(), &[("zm-a", 10), ("zm-b", 2)]).await;
     assert_eq!(o["pricingTier"], "standard");
     assert_eq!(o["items"][0]["productId"], "zm-a");
-    assert_eq!(o["items"][0]["unitPrice"], 63);
+    // 25 % of MRP ₹210 = ₹52.50 → ₹53; 25 % of ₹5,000 = ₹1,250.
+    assert_eq!(o["items"][0]["unitPrice"], 53);
     assert_eq!(o["items"][0]["unitMrp"], 210);
-    assert_eq!(o["items"][0]["lineTotal"], 630);
-    assert_eq!(o["items"][1]["unitPrice"], 1500);
-    assert_eq!(o["items"][1]["lineTotal"], 3000);
-    assert_eq!(o["totalAmount"], 3630);
+    assert_eq!(o["items"][0]["lineTotal"], 530);
+    assert_eq!(o["items"][1]["unitPrice"], 1250);
+    assert_eq!(o["items"][1]["lineTotal"], 2500);
+    assert_eq!(o["subtotal"], 3030);
+    assert_eq!(o["deliveryFee"], 350);
+    assert_eq!(o["totalAmount"], 3380);
     assert_eq!(o["mrpTotal"], 2100 + 10_000);
 
     assert_eq!(admin["pricingTier"], "standard");
-    assert_eq!(admin["totalAmount"], 3630);
-    assert_eq!(admin["items"][0]["unitPrice"], 63);
+    assert_eq!(admin["subtotal"], 3030);
+    assert_eq!(admin["deliveryFee"], 350);
+    assert_eq!(admin["totalAmount"], 3380);
+    assert_eq!(admin["items"][0]["unitPrice"], 53);
 
     let number = o["orderNumber"].as_str().expect("number");
     assert_eq!(
         stored_tier(&h, number).await,
-        ("standard".to_owned(), 363_000)
+        ("standard".to_owned(), 338_000)
     );
+    // total_paise = sum(line totals) + delivery_fee_paise.
     let line_sum = h
         .count("SELECT sum(line_total_paise)::bigint FROM order_items")
         .await;
-    assert_eq!(line_sum, 363_000);
+    assert_eq!(line_sum, 303_000);
+    assert_eq!(
+        h.count("SELECT delivery_fee_paise FROM orders").await,
+        35_000
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1714,9 +1737,12 @@ async fn large_order_is_charged_list_prices(pool: PgPool) {
     assert_eq!(o["pricingTier"], "bulk");
     assert_eq!(o["items"][0]["unitPrice"], 32);
     assert_eq!(o["items"][1]["unitPrice"], 1000);
+    assert_eq!(o["subtotal"], 11_000);
+    assert_eq!(o["deliveryFee"], 0, "₹5,000+ ships free");
     assert_eq!(o["totalAmount"], 11_000);
     assert_eq!(o["mrpTotal"], 52_500 + 15_000);
     assert_eq!(admin["pricingTier"], "bulk");
+    assert_eq!(admin["deliveryFee"], 0);
     let number = o["orderNumber"].as_str().expect("number");
     assert_eq!(
         stored_tier(&h, number).await,
@@ -1729,6 +1755,8 @@ async fn large_order_is_charged_list_prices(pool: PgPool) {
     assert_eq!(r.body["order"]["orderNumber"], number);
     assert_eq!(r.body["order"]["pricingTier"], "bulk");
     assert_eq!(r.body["order"]["totalAmount"], 11_000);
+    assert_eq!(r.body["order"]["subtotal"], 11_000);
+    assert_eq!(r.body["order"]["deliveryFee"], 0);
     assert_eq!(h.count("SELECT count(*) FROM orders").await, 1);
 }
 
@@ -1741,8 +1769,9 @@ async fn bulk_minimum_is_inclusive(pool: PgPool) {
     let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-a", 250), ("zm-b", 2)]).await;
     assert_eq!(o["pricingTier"], "bulk");
     assert_eq!(o["totalAmount"], 10_000);
+    assert_eq!(o["deliveryFee"], 0);
 
-    // ₹32 short of it (₹9,968) → standard on every line: ₹63 × 249 + ₹1,500 × 2.
+    // ₹32 short of it (₹9,968) → standard on every line: ₹53 × 249 + ₹1,250 × 2.
     let r = h
         .order(order_body(
             Uuid::new_v4(),
@@ -1752,7 +1781,8 @@ async fn bulk_minimum_is_inclusive(pool: PgPool) {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
     assert_eq!(r.body["order"]["pricingTier"], "standard");
-    assert_eq!(r.body["order"]["totalAmount"], 15_687 + 3_000);
+    assert_eq!(r.body["order"]["totalAmount"], 13_197 + 2_500);
+    assert_eq!(r.body["order"]["deliveryFee"], 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1766,7 +1796,12 @@ async fn bulk_minimum_is_configurable(pool: PgPool) {
 
     let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-b", 2)]).await;
     assert_eq!(o["pricingTier"], "bulk");
-    assert_eq!(o["totalAmount"], 2_000);
+    assert_eq!(o["subtotal"], 2_000);
+    assert_eq!(
+        o["totalAmount"],
+        2_000 + 350,
+        "bulk but below ₹5,000: delivery charged"
+    );
 
     let r = h
         .order(order_body(Uuid::new_v4(), "9840012346", &[("zm-a", 10)]))
@@ -1776,6 +1811,127 @@ async fn bulk_minimum_is_configurable(pool: PgPool) {
     assert_eq!(r.body["order"]["items"][0]["unitPrice"], 84); // 40 % of ₹210
 }
 
+// ---------------------------------------------------------------------------
+// Delivery charge (₹350 below a ₹5,000 subtotal, free from ₹5,000 inclusive)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delivery_is_charged_below_the_free_minimum_only(pool: PgPool) {
+    let h = setup(pool).await;
+    // ₹100, not discounted: the same price in both tiers.
+    add_product(&h.pool, "zm-flat", 10_000, 10_000, 1_000, true).await;
+
+    // ₹4,900 of goods → ₹350 delivery. The total (₹5,250) exceeds the goods'
+    // MRP (₹4,900): allowed, the MRP check is on the goods only.
+    let key = Uuid::new_v4();
+    let (o, admin) = place_priced(&h, key, &[("zm-flat", 49)]).await;
+    assert_eq!(o["pricingTier"], "standard");
+    assert_eq!(o["subtotal"], 4_900);
+    assert_eq!(o["deliveryFee"], 350);
+    assert_eq!(o["totalAmount"], 5_250);
+    assert_eq!(o["mrpTotal"], 4_900);
+    assert_eq!(admin["subtotal"], 4_900);
+    assert_eq!(admin["deliveryFee"], 350);
+    assert_eq!(admin["totalAmount"], 5_250);
+    let number = o["orderNumber"].as_str().expect("number").to_owned();
+    assert_eq!(
+        stored_tier(&h, &number).await,
+        ("standard".to_owned(), 525_000)
+    );
+
+    // Idempotent replay: same body, same numbers.
+    let r1 = h
+        .order(order_body(key, "9840012345", &[("zm-flat", 49)]))
+        .await;
+    assert_eq!(r1.status, StatusCode::OK, "{}", r1.body);
+    assert_eq!(r1.body["order"], o);
+
+    // Exactly ₹5,000 → free.
+    let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-flat", 50)]).await;
+    assert_eq!(o["subtotal"], 5_000);
+    assert_eq!(o["deliveryFee"], 0);
+    assert_eq!(o["totalAmount"], 5_000);
+
+    // Above → free.
+    let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-flat", 51)]).await;
+    assert_eq!(o["deliveryFee"], 0);
+    assert_eq!(o["totalAmount"], 5_100);
+
+    // A single small item: ₹100 + ₹350.
+    let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-flat", 1)]).await;
+    assert_eq!(o["subtotal"], 100);
+    assert_eq!(o["deliveryFee"], 350);
+    assert_eq!(o["totalAmount"], 450);
+
+    // Invariant for every order: total = line totals + fee.
+    let mismatched = h
+        .count(
+            "SELECT count(*) FROM orders o WHERE o.total_paise <> \
+             (SELECT sum(line_total_paise) FROM order_items i WHERE i.order_id = o.id) + o.delivery_fee_paise",
+        )
+        .await;
+    assert_eq!(mismatched, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delivery_charge_is_configurable(pool: PgPool) {
+    let h = setup_with(pool, |c| {
+        c.pricing.delivery_fee_paise = 9_950; // ₹99.50
+        c.pricing.free_delivery_min_paise = 20_000; // ₹200
+    })
+    .await;
+    add_product(&h.pool, "zm-flat", 10_000, 10_000, 1_000, true).await;
+    let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-flat", 1)]).await;
+    assert_eq!(o["deliveryFee"].as_f64(), Some(99.5));
+    assert_eq!(o["totalAmount"].as_f64(), Some(199.5));
+    let (o, _) = place_priced(&h, Uuid::new_v4(), &[("zm-flat", 2)]).await;
+    assert_eq!(o["deliveryFee"], 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn zero_free_delivery_minimum_means_always_free(pool: PgPool) {
+    let h = setup_with(pool, |c| c.pricing.free_delivery_min_paise = 0).await;
+    add_product(&h.pool, "zm-flat", 10_000, 10_000, 1_000, true).await;
+    let r = h
+        .order(order_body(Uuid::new_v4(), "9840012346", &[("zm-flat", 1)]))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert_eq!(r.body["order"]["deliveryFee"], 0);
+    assert_eq!(r.body["order"]["totalAmount"], 100);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn customer_state_is_optional_and_defaults_to_tamil_nadu(pool: PgPool) {
+    let h = setup(pool).await;
+    add_product(&h.pool, "zm-flat", 10_000, 10_000, 1_000, true).await;
+
+    let mut body = order_body(Uuid::new_v4(), "9840012345", &[("zm-flat", 1)]);
+    body["customer"]
+        .as_object_mut()
+        .expect("customer")
+        .remove("state");
+    let r = h.order(body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let id = h
+        .order_id(r.body["order"]["orderNumber"].as_str().expect("n"))
+        .await;
+    assert_eq!(h.get_order(id).await["customer"]["state"], "Tamil Nadu");
+
+    let mut body = order_body(Uuid::new_v4(), "9840012346", &[("zm-flat", 1)]);
+    body["customer"]["state"] = json!("  ");
+    let r = h.order(body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let id = h
+        .order_id(r.body["order"]["orderNumber"].as_str().expect("n"))
+        .await;
+    assert_eq!(h.get_order(id).await["customer"]["state"], "Tamil Nadu");
+
+    let mut body = order_body(Uuid::new_v4(), "9840012347", &[("zm-flat", 1)]);
+    body["customer"]["state"] = json!("x");
+    let r = h.order(body).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn test_mode_records_tier_from_list_prices_but_charges_one_rupee(pool: PgPool) {
     let h = setup_with(pool, |c| c.payment_test_mode = true).await;
@@ -1783,7 +1939,9 @@ async fn test_mode_records_tier_from_list_prices_but_charges_one_rupee(pool: PgP
 
     let (small, _) = place_priced(&h, Uuid::new_v4(), &[("zm-a", 10)]).await;
     assert_eq!(small["pricingTier"], "standard");
-    assert_eq!(small["totalAmount"], 10);
+    assert_eq!(small["subtotal"], 10);
+    assert_eq!(small["deliveryFee"], 1);
+    assert_eq!(small["totalAmount"], 11);
     assert_eq!(small["items"][0]["unitPrice"], 1);
 
     let r = h
@@ -1795,7 +1953,7 @@ async fn test_mode_records_tier_from_list_prices_but_charges_one_rupee(pool: PgP
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
     assert_eq!(r.body["order"]["pricingTier"], "bulk");
-    assert_eq!(r.body["order"]["totalAmount"], 252);
+    assert_eq!(r.body["order"]["totalAmount"], 252 + 1);
 }
 
 /// Move every `pending_payment` order's deadline into the past.
@@ -2130,7 +2288,7 @@ async fn pay_later_mode_places_confirmed_orders_and_notifies_once(pool: PgPool) 
     assert_eq!(o["status"], "pending_pack");
     assert_eq!(o["paymentExpiresAt"], Value::Null);
     assert_eq!(o["isTest"], false);
-    assert_eq!(o["totalAmount"], 330);
+    assert_eq!(o["totalAmount"], 330 + 350);
     assert!(r.body["orderToken"].is_string());
     assert_eq!(h.stock("zm-01").await, 48, "stock deducted at placement");
 
@@ -2213,8 +2371,9 @@ async fn pay_later_mode_without_notifications_and_test_pricing(pool: PgPool) {
     assert_eq!(r.body["order"]["status"], "pending_pack");
     assert_eq!(r.body["order"]["isTest"], true);
     assert_eq!(
-        r.body["order"]["totalAmount"], 3,
-        "₹1 per unit in pay-later mode too"
+        r.body["order"]["totalAmount"],
+        3 + 1,
+        "₹1 per unit (and ₹1 delivery) in pay-later mode too"
     );
     assert_eq!(h.count(OUTBOX_ROWS).await, 0, "notifications disabled");
 
@@ -2224,7 +2383,7 @@ async fn pay_later_mode_without_notifications_and_test_pricing(pool: PgPool) {
         .await
         .expect("real");
     let d = h.admin_get("/api/v1/admin/dashboard").await;
-    assert_eq!(d.body["revenue"]["pendingCollection"], 3);
+    assert_eq!(d.body["revenue"]["pendingCollection"], 4);
     assert_eq!(
         d.body["unpaid"]["orders"], 0,
         "pay-later orders are not awaiting online payment"

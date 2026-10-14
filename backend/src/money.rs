@@ -38,7 +38,8 @@ pub fn discount_percent(price_paise: i64, mrp_paise: i64) -> i32 {
 /// above the MRP. Without an MRP (or when the product is not discounted that
 /// much) it is simply `price_paise`.
 ///
-/// Example (70 % off): MRP ₹210, list price ₹32 → ₹63; MRP ₹550 → ₹165.
+/// Example (75 % off): MRP ₹210, list price ₹32 → ₹53 (₹52.50 rounded up);
+/// MRP ₹200 → ₹50.
 pub fn standard_price_paise(
     price_paise: i64,
     mrp_paise: i64,
@@ -121,34 +122,35 @@ mod tests {
 
     #[test]
     fn standard_price_is_mrp_less_discount_ceiled_to_whole_rupee() {
-        // MRP ₹210 × 30 % = ₹63 exactly.
-        assert_eq!(standard_price_paise(3_200, 21_000, 70), 6_300);
-        // MRP ₹550 × 30 % = ₹165.
-        assert_eq!(standard_price_paise(8_300, 55_000, 70), 16_500);
-        // MRP ₹215 × 30 % = ₹64.50 → ceiled to ₹65.
-        assert_eq!(standard_price_paise(3_300, 21_500, 70), 6_500);
-        // MRP ₹100.01 × 30 % = ₹30.003 → ₹31 (any fraction rounds up).
-        assert_eq!(standard_price_paise(1_000, 10_001, 70), 3_100);
+        // MRP ₹200 × 25 % = ₹50 exactly.
+        assert_eq!(standard_price_paise(1_000, 20_000, 75), 5_000);
+        // MRP ₹210 × 25 % = ₹52.50 → ceiled to ₹53.
+        assert_eq!(standard_price_paise(3_200, 21_000, 75), 5_300);
+        // MRP ₹550 × 25 % = ₹137.50 → ₹138.
+        assert_eq!(standard_price_paise(8_300, 55_000, 75), 13_800);
+        // MRP ₹100.01 × 25 % = ₹25.0025 → ₹26 (any fraction rounds up).
+        assert_eq!(standard_price_paise(1_000, 10_001, 75), 2_600);
         // Other configured discounts.
+        assert_eq!(standard_price_paise(3_200, 21_000, 70), 6_300);
         assert_eq!(standard_price_paise(1_000, 30_000, 60), 12_000);
         assert_eq!(standard_price_paise(1_000, 30_000, 0), 30_000);
     }
 
     #[test]
     fn standard_price_never_below_list_price_or_above_mrp() {
-        // Only 45 % off MRP: the standard price is the list price.
-        assert_eq!(standard_price_paise(16_500, 30_000, 70), 16_500);
+        // Only 45 % off MRP (< 75 %): the standard price is the list price.
+        assert_eq!(standard_price_paise(16_500, 30_000, 75), 16_500);
         // List price equal to MRP.
-        assert_eq!(standard_price_paise(5_000, 5_000, 70), 5_000);
+        assert_eq!(standard_price_paise(5_000, 5_000, 75), 5_000);
         // No MRP: list price.
-        assert_eq!(standard_price_paise(1_000, 0, 70), 1_000);
-        assert_eq!(standard_price_paise(1_000, -5, 70), 1_000);
+        assert_eq!(standard_price_paise(1_000, 0, 75), 1_000);
+        assert_eq!(standard_price_paise(1_000, -5, 75), 1_000);
         // Rounding up to a rupee must not exceed a sub-rupee MRP.
-        assert_eq!(standard_price_paise(50, 80, 70), 80);
+        assert_eq!(standard_price_paise(50, 80, 75), 80);
         // 100 % "discount" (or more) falls back to the list price.
         assert_eq!(standard_price_paise(1_000, 30_000, 100), 1_000);
         assert_eq!(standard_price_paise(1_000, 30_000, 250), 1_000);
         // Huge MRP saturates instead of overflowing.
-        assert!(standard_price_paise(1, i64::MAX, 70) >= 1);
+        assert!(standard_price_paise(1, i64::MAX, 75) >= 1);
     }
 }

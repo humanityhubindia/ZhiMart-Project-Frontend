@@ -36,6 +36,9 @@ export function normalizePricing(raw: Partial<PricingRules> | undefined): Pricin
       raw?.standardDiscountPercent,
       DEFAULT_PRICING.standardDiscountPercent
     ),
+    // Optional on older servers. `freeDeliveryMin: 0` = delivery always free.
+    deliveryFee: nonNegative(raw?.deliveryFee, DEFAULT_PRICING.deliveryFee),
+    freeDeliveryMin: nonNegative(raw?.freeDeliveryMin, DEFAULT_PRICING.freeDeliveryMin),
   };
 }
 
@@ -48,6 +51,8 @@ export interface StorefrontConfig {
   currency: string;
   paymentExpiryMinutes: number;
   storeName: string;
+  /** Same rules as `GET /products` → `pricing`; null when the server doesn't send them. */
+  pricing: PricingRules | null;
 }
 
 /** Defensive normalisation so a slightly-off payload can't crash the storefront. */
@@ -106,7 +111,10 @@ export async function fetchProducts(signal?: AbortSignal): Promise<CrackerProduc
 }
 
 export async function fetchStorefrontConfig(signal?: AbortSignal): Promise<StorefrontConfig> {
-  const res = await apiRequest<Partial<StorefrontConfig>>('/storefront/config', { signal });
+  const res = await apiRequest<Omit<Partial<StorefrontConfig>, 'pricing'> & { pricing?: Partial<PricingRules> | null }>(
+    '/storefront/config',
+    { signal }
+  );
   return {
     testMode: res?.testMode === true,
     onlinePaymentsEnabled: res?.onlinePaymentsEnabled === true,
@@ -114,6 +122,7 @@ export async function fetchStorefrontConfig(signal?: AbortSignal): Promise<Store
     currency: res?.currency ?? 'INR',
     paymentExpiryMinutes: Number(res?.paymentExpiryMinutes) || 30,
     storeName: res?.storeName || 'Zhi-Mart Fireworks',
+    pricing: res?.pricing ? normalizePricing(res.pricing) : null,
   };
 }
 

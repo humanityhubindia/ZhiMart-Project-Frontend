@@ -10,7 +10,6 @@ export interface CheckoutFormValues {
   email: string;
   address: string;
   city: string;
-  state: string;
   pincode: string;
   notes: string;
 }
@@ -24,7 +23,6 @@ export const EMPTY_CHECKOUT_FORM: CheckoutFormValues = {
   email: '',
   address: '',
   city: '',
-  state: '',
   pincode: '',
   notes: '',
 };
@@ -34,12 +32,11 @@ const LIMITS = {
   email: 254,
   address: 500,
   city: 100,
-  state: 100,
   notes: 1000,
 } as const;
 
 /**
- * Accepts `9840012345`, `+91 98400 12345`, `+91-98400-12345`, `09840012345`, `919840012345`.
+ * Accepts `9XXXXXXXXX`, `+91 9XXXX XXXXX`, `+91-9XXXX-XXXXX`, `09XXXXXXXXX`, `919XXXXXXXXX`.
  * Returns the bare 10-digit Indian mobile number, or null if invalid.
  */
 export function normalizeIndianMobile(input: string): string | null {
@@ -56,7 +53,6 @@ export function validateCheckout(values: CheckoutFormValues): CheckoutErrors {
   const name = values.name.trim();
   const address = values.address.trim();
   const city = values.city.trim();
-  const state = values.state.trim();
   const email = values.email.trim();
   const pincode = values.pincode.trim();
 
@@ -66,11 +62,11 @@ export function validateCheckout(values: CheckoutFormValues): CheckoutErrors {
 
   if (!values.phone.trim()) errors.phone = 'Please enter a mobile number.';
   else if (!normalizeIndianMobile(values.phone))
-    errors.phone = 'Enter a valid 10-digit Indian mobile number (e.g. 98400 12345).';
+    errors.phone = 'Enter a valid 10-digit Indian mobile number.';
 
   if (!email) errors.email = "Please enter your email — we'll send your order confirmation and tracking link there.";
   else if (email.length > LIMITS.email) errors.email = `Email must be at most ${LIMITS.email} characters.`;
-  else if (!EMAIL_RE.test(email)) errors.email = 'Enter a valid email address (e.g. name@example.com).';
+  else if (!EMAIL_RE.test(email)) errors.email = 'Enter a valid email address.';
 
   if (!address) errors.address = 'Please enter the delivery address.';
   else if (address.length < 5) errors.address = 'Please enter the full delivery address.';
@@ -79,9 +75,6 @@ export function validateCheckout(values: CheckoutFormValues): CheckoutErrors {
 
   if (!city) errors.city = 'Please enter the city.';
   else if (city.length > LIMITS.city) errors.city = `City must be at most ${LIMITS.city} characters.`;
-
-  if (!state) errors.state = 'Please enter the state.';
-  else if (state.length > LIMITS.state) errors.state = `State must be at most ${LIMITS.state} characters.`;
 
   if (!pincode) errors.pincode = 'Please enter the pincode.';
   else if (!PINCODE_RE.test(pincode)) errors.pincode = 'Enter a valid 6-digit pincode.';
@@ -92,6 +85,15 @@ export function validateCheckout(values: CheckoutFormValues): CheckoutErrors {
   return errors;
 }
 
+/** The only state we deliver to (sent with every order; not asked on the form). */
+export const DELIVERY_STATE = 'Tamil Nadu';
+
+/**
+ * Checkout fields the customer must fill in (mirrors `validateCheckout`) — drives the red asterisk
+ * and `required` on the form. Notes are optional.
+ */
+export const REQUIRED_CHECKOUT_FIELDS: readonly CheckoutField[] = ['name', 'phone', 'email', 'address', 'city', 'pincode'];
+
 export function toOrderCustomer(values: CheckoutFormValues): OrderCustomerInput {
   return {
     name: values.name.trim(),
@@ -100,13 +102,17 @@ export function toOrderCustomer(values: CheckoutFormValues): OrderCustomerInput 
     email: values.email.trim(),
     address: values.address.trim(),
     city: values.city.trim(),
-    state: values.state.trim(),
+    // Delivery is only available within Tamil Nadu, so the state is fixed.
+    state: DELIVERY_STATE,
     pincode: values.pincode.trim(),
   };
 }
 
-/** Business WhatsApp number used for order follow-ups (static contact info). */
-export const BUSINESS_WHATSAPP_NUMBER = '919840012345';
+/**
+ * The single business number for phone calls and WhatsApp (country code + 10 digits, no `+`),
+ * used by every "call us" / WhatsApp link on the site (display forms live in `lib/contact.ts`).
+ */
+export const BUSINESS_WHATSAPP_NUMBER = '919597961800';
 
 export function openWhatsApp(message: string) {
   window.open(
@@ -124,6 +130,8 @@ export function buildOrderShareMessage(
   order: {
     orderNumber: string;
     totalAmount: number;
+    /** Delivery charge included in `totalAmount` (absent/0 = free). */
+    deliveryFee?: number;
     mrpTotal: number;
     isTest?: boolean;
     pricingTier?: 'bulk' | 'standard';
@@ -145,6 +153,9 @@ export function buildOrderShareMessage(
     `*Customer:* ${customer.name}${customer.city ? `, ${customer.city}` : ''}\n\n` +
     `*ORDER ITEMS:*\n${lines}\n\n` +
     `---------------------------------\n` +
+    (order.deliveryFee !== undefined
+      ? `*Delivery:* ${order.deliveryFee > 0 ? `₹${formatAmount(order.deliveryFee)}` : 'FREE'}\n`
+      : '') +
     `*ORDER TOTAL:* ₹${formatAmount(order.totalAmount)}\n` +
     (order.pricingTier && !order.isTest
       ? `*Pricing:* ${order.pricingTier === 'bulk' ? 'Bulk price' : 'Standard price'}\n`
@@ -184,7 +195,6 @@ const SERVER_FIELD_LABELS: Record<CheckoutField, string> = {
   email: 'Email',
   address: 'Address',
   city: 'City',
-  state: 'State',
   pincode: 'Pincode',
   notes: 'Notes',
 };
@@ -194,7 +204,7 @@ const SERVER_FIELD_LABELS: Record<CheckoutField, string> = {
  * and returns it with a readable message, or null if it isn't about a form field.
  */
 export function mapServerValidation(message: string): { field: CheckoutField; message: string } | null {
-  const match = /\b(?:customer\.(name|phone|email|address|city|state|pincode)|(notes))\b/.exec(message);
+  const match = /\b(?:customer\.(name|phone|email|address|city|pincode)|(notes))\b/.exec(message);
   if (!match) return null;
   const field = (match[1] ?? match[2]) as CheckoutField;
   const readable = message.replace(match[0], SERVER_FIELD_LABELS[field]).trim();

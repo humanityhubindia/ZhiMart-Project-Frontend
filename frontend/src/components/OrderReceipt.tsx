@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import type { GuestOrder } from '../lib/ordersApi';
 import { usePricingRules } from '../hooks/useProducts';
 import { pricingTierLabel } from '../lib/pricingTier';
+import { NO_TAX_NOTE } from '../lib/money';
 import { BUSINESS_PROFILE, formatDateTime, formatINR, instrumentLabel, numberToWords } from './admin/format';
 
 /**
@@ -29,7 +30,8 @@ export const OrderReceiptPrint: React.FC<{ order: GuestOrder; statusLabel: strin
         ? 'Pay later — to be confirmed with our team'
         : 'Awaiting payment';
 
-  const discount = Math.max(0, Math.round((order.mrpTotal - order.totalAmount) * 100) / 100);
+  // Savings are on goods (subtotal) only — the delivery charge is not part of the discount.
+  const discount = Math.max(0, Math.round((order.mrpTotal - order.subtotal) * 100) / 100);
   const discountPct = order.mrpTotal > 0 ? Math.round((discount / order.mrpTotal) * 100) : 0;
   // Test orders are charged ₹1/unit — no MRP savings or price tier to show.
   const tierLine = order.pricingTier && !order.isTest ? pricingTierLabel(order.pricingTier, rules) : null;
@@ -153,10 +155,25 @@ export const OrderReceiptPrint: React.FC<{ order: GuestOrder; statusLabel: strin
                 <span className="font-black text-slate-900">Pricing:</span> {tierLine}
               </p>
             )}
+            <div className="pt-1.5 border-t border-slate-200 flex justify-between font-bold">
+              <span>Subtotal:</span>
+              <span className="tabular-nums">{formatINR(order.subtotal)}</span>
+            </div>
+            <div className="flex justify-between text-slate-600">
+              <span>Delivery charge:</span>
+              <span className={order.deliveryFee > 0 ? 'tabular-nums' : 'font-black text-emerald-700'}>
+                {order.deliveryFee > 0 ? formatINR(order.deliveryFee) : 'FREE'}
+              </span>
+            </div>
+            <div className="flex justify-between text-slate-600">
+              <span>Tax (GST):</span>
+              <span className="tabular-nums">{formatINR(0)}</span>
+            </div>
             <div className="pt-2 border-t-2 border-slate-900 flex justify-between items-baseline font-black text-sm">
               <span>{isPaid ? 'Amount paid' : isPayLater ? 'Amount payable' : 'Order total'}:</span>
               <span className="text-base tabular-nums">{formatINR(order.totalAmount)}</span>
             </div>
+            <p className="text-[10px] text-slate-500 text-right">{NO_TAX_NOTE}</p>
             <p className="text-[10px] text-slate-500 italic text-right">
               Amount in words: {numberToWords(order.totalAmount)}
             </p>

@@ -15,7 +15,16 @@ import {
 } from 'lucide-react';
 import { CrackerProduct } from '../types';
 import { useProducts, countBy, useTestMode, usePricingRules } from '../hooks/useProducts';
-import { CartTotals, computeTotals, formatRupees, hasBulkThreshold, lineTotal, PricingRules, unitPriceFor } from '../lib/money';
+import {
+  CartTotals,
+  computeTotals,
+  formatRupees,
+  hasBulkThreshold,
+  hasDeliveryCharge,
+  lineTotal,
+  PricingRules,
+  unitPriceFor,
+} from '../lib/money';
 import { StockBadge } from './StockBadge';
 import { CatalogErrorCard, EmptyCatalogState, ListSkeleton, errorMessage } from './CatalogStates';
 
@@ -36,7 +45,7 @@ export const categoryLabel = (category: string) =>
     .toLowerCase()
     .replace(/\b\w/g, (c) => c.toUpperCase());
 
-/** "85% OFF on orders ₹10,000+ • 70% OFF below" */
+/** "85% OFF on orders ₹10,000+ • 75% OFF below" */
 export const tierSubtitle = (rules: PricingRules) =>
   hasBulkThreshold(rules)
     ? `${rules.bulkDiscountPercent}% OFF on orders ₹${formatRupees(rules.bulkMinOrder)}+ • ${rules.standardDiscountPercent}% OFF below`
@@ -60,6 +69,15 @@ export const TierRate: React.FC<{ product: CrackerProduct; bulkUnlocked: boolean
       <span className={bulkUnlocked ? inactive : active}>₹{formatRupees(product.standardPrice)}</span>
     </span>
   );
+};
+
+/** "+ ₹350 delivery (FREE on orders ₹5,000+)" / "FREE delivery" for an estimate's goods value. */
+export const deliveryNote = (totals: CartTotals): string | null => {
+  const { rules } = totals;
+  if (totals.subtotal <= 0 || !hasDeliveryCharge(rules)) return null;
+  return totals.deliveryFee > 0
+    ? `+ ₹${formatRupees(totals.deliveryFee)} delivery charge (FREE delivery on orders ₹${formatRupees(rules.freeDeliveryMin)}+) · ₹0 GST`
+    : 'FREE delivery · ₹0 GST';
 };
 
 /**
@@ -161,7 +179,8 @@ export const QuickEstimatePage: React.FC<QuickEstimatePageProps> = ({
 
   const totals = computeTotals(selectedItems, rules);
   const {
-    total: totalEstimate,
+    // Goods value only; delivery is added at checkout (see the delivery note below).
+    subtotal: totalEstimate,
     mrpTotal: totalOriginal,
     savings: totalSavings,
     units: totalPacksCount,
@@ -186,7 +205,9 @@ export const QuickEstimatePage: React.FC<QuickEstimatePageProps> = ({
 
   const handleShareEstimate = () => {
     const text = encodeURIComponent(
-      `Zhi-mart Diwali Estimate: ${selectedItems.length} items, Total: ₹${formatRupees(totalEstimate)}${tierNote}${testMode ? '' : ` (Saved ₹${formatRupees(totalSavings)})`}!\n${window.location.href}`
+      `Zhi-mart Diwali Estimate: ${selectedItems.length} items, Total: ₹${formatRupees(totalEstimate)}${
+        totals.deliveryFee > 0 ? ` + ₹${formatRupees(totals.deliveryFee)} delivery` : ''
+      }${tierNote}${testMode ? '' : ` (Saved ₹${formatRupees(totalSavings)})`}!\n${window.location.href}`
     );
     window.open(`https://api.whatsapp.com/send?text=${text}`, '_blank');
   };
@@ -458,6 +479,9 @@ export const QuickEstimatePage: React.FC<QuickEstimatePageProps> = ({
                 : `You Save: ₹${formatRupees(totalSavings)} (${discountPercent}% Festival Savings)`}{' '}
               &bull; {totalPacksCount} packs
             </div>
+            {deliveryNote(totals) && (
+              <div className="text-[11px] font-semibold text-slate-500">{deliveryNote(totals)}</div>
+            )}
             {!testMode && <BulkTierSummary totals={totals} className="pt-1" />}
           </div>
 

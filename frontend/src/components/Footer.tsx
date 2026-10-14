@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Send, Facebook, Twitter, Instagram, Linkedin, Apple, Play, Flame } from 'lucide-react';
+import { SUPPORT_PHONE_DISPLAY, SUPPORT_PHONE_TEL, supportWhatsAppUrl } from '../lib/contact';
 
 export const Footer: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -24,7 +25,7 @@ export const Footer: React.FC = () => {
               NEWSLETTER
             </h3>
             <p className="text-xs text-[#7B808C] font-semibold mt-0.5">
-              Stay Upto Date With Diwali 2025 Price Drops
+              Stay Upto Date With Diwali 2026 Price Drops
             </p>
           </div>
 
@@ -52,7 +53,7 @@ export const Footer: React.FC = () => {
 
         {subscribed && (
           <div className="text-center text-xs font-semibold text-emerald-700 -mt-10 mb-8">
-            Thank you! Zhi-mart 2025 Diwali rate card has been sent to your email.
+            Thank you! Zhi-mart 2026 Diwali rate card has been sent to your email.
           </div>
         )}
 
@@ -133,7 +134,23 @@ export const Footer: React.FC = () => {
               CONTACT INFO
             </h4>
             <div className="space-y-2 text-xs font-medium text-[#585C66]">
-              <p>Helpline: +91 98400 12345</p>
+              <p>
+                Helpline:{' '}
+                <a href={`tel:${SUPPORT_PHONE_TEL}`} className="hover:text-black">
+                  {SUPPORT_PHONE_DISPLAY}
+                </a>
+              </p>
+              <p>
+                WhatsApp:{' '}
+                <a
+                  href={supportWhatsAppUrl('Hello Zhi-mart Crackers, I want to order crackers!')}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-black"
+                >
+                  {SUPPORT_PHONE_DISPLAY}
+                </a>
+              </p>
               <p>Email: sales@zhimartcrackers.com</p>
               <p>Depot: Bypass Road, Sivakasi, TN, India</p>
             </div>
@@ -158,7 +175,7 @@ export const Footer: React.FC = () => {
 
         {/* Bottom Copyright Row */}
         <div className="pt-8 flex flex-col sm:flex-row items-center justify-between text-xs font-semibold text-[#666B75] gap-3">
-          <p>© 2025 Zhi-mart Crackers | All rights reserved</p>
+          <p>© 2026 Zhi-mart Crackers | All rights reserved</p>
           <div className="flex items-center gap-3">
             <span>Handcrafted for Premium Celebrations</span>
             <span>•</span>

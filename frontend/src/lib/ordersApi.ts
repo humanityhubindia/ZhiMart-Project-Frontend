@@ -7,6 +7,7 @@
  *   creating a second one; the same key with a different payload → 409 `idempotency_conflict`.
  */
 import { apiRequest } from './api';
+import { orderCharges } from './money';
 
 export interface OrderCustomerInput {
   name: string;
@@ -15,6 +16,7 @@ export interface OrderCustomerInput {
   email: string;
   address: string;
   city: string;
+  /** Always "Tamil Nadu" — delivery is only available within Tamil Nadu. */
   state: string;
   pincode: string;
 }
@@ -67,6 +69,11 @@ export interface PlacedOrder {
   /** When the stock reservation lapses if unpaid (RFC 3339). */
   paymentExpiresAt?: string | null;
   isTest?: boolean;
+  /** Goods value after tier pricing (rupees). */
+  subtotal: number;
+  /** Delivery charge (rupees, 0 = free). */
+  deliveryFee: number;
+  /** Amount payable: `subtotal + deliveryFee`. */
   totalAmount: number;
   mrpTotal: number;
   /** Tier the server applied (authoritative — may differ from the cart's estimate). */
@@ -96,6 +103,11 @@ export interface GuestOrder {
     instrument: string | null;
     paidAt: string | null;
   };
+  /** Goods value after tier pricing (rupees). */
+  subtotal: number;
+  /** Delivery charge (rupees, 0 = free). */
+  deliveryFee: number;
+  /** Amount payable: `subtotal + deliveryFee`. */
   totalAmount: number;
   mrpTotal: number;
   /** Tier the server applied (absent on older servers). */
@@ -138,6 +150,13 @@ export const ORDER_LIMITS = {
   maxQuantityPerLine: 1000,
 } as const;
 
+/** Fills `subtotal`/`deliveryFee` for orders placed before delivery charges existed (fee 0). */
+const chargesOf = (raw: { totalAmount?: number; subtotal?: number | null; deliveryFee?: number | null } | undefined) => {
+  const totalAmount = Number(raw?.totalAmount) || 0;
+  const { subtotal, deliveryFee } = orderCharges({ totalAmount, subtotal: raw?.subtotal, deliveryFee: raw?.deliveryFee });
+  return { totalAmount, subtotal, deliveryFee };
+};
+
 export async function placeOrder(payload: PlaceOrderPayload, signal?: AbortSignal): Promise<PlaceOrderResult> {
   const res = await apiRequest<PlaceOrderResult>('/orders', {
     method: 'POST',
@@ -148,6 +167,7 @@ export async function placeOrder(payload: PlaceOrderPayload, signal?: AbortSigna
   return {
     order: {
       ...order,
+      ...chargesOf(order),
       pricingTier: toPricingTier(order?.pricingTier),
       items: Array.isArray(order?.items) ? order.items : [],
     },
@@ -161,6 +181,7 @@ const tokenHeader = (orderToken: string) => ({ 'X-Order-Token': orderToken });
 function normalizeGuestOrder(raw: GuestOrder): GuestOrder {
   return {
     ...raw,
+    ...chargesOf(raw),
     isTest: raw?.isTest === true,
     pricingTier: toPricingTier(raw?.pricingTier),
     paymentExpiresAt: raw?.paymentExpiresAt ?? null,

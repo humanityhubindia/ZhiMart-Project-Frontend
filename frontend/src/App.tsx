@@ -190,7 +190,7 @@ export function App() {
   const [isBrandsModalOpen, setIsBrandsModalOpen] = useState(false);
 
   const totalCartCount = cart.totals.units;
-  const totalCartPrice = cart.totals.total;
+  const totalCartPrice = cart.totals.subtotal;
 
   // Selected Product for dedicated Product Page
   const currentProduct =
@@ -204,7 +204,7 @@ export function App() {
     if (selectedBrandFilter !== 'all') return `Products by ${selectedBrandFilter}`;
     if (activeTab === 'popular') return 'Popular Crackers';
     if (activeTab === 'bestselling') return 'Best Selling Crackers';
-    if (activeTab === 'newarrivals') return 'New Arrivals 2025';
+    if (activeTab === 'newarrivals') return 'New Arrivals 2026';
     if (activeTab === 'party') return 'Party & Functions Specials';
     return 'All Sivakasi Direct Products';
   };

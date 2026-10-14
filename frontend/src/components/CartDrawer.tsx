@@ -11,9 +11,9 @@ import {
   EMPTY_CHECKOUT_FORM,
   validateCheckout,
 } from '../lib/checkout';
-import { computeTotals, formatRupees, lineTotal, unitPriceFor } from '../lib/money';
+import { computeTotals, formatRupees, lineTotal, NO_TAX_NOTE, unitPriceFor } from '../lib/money';
 import { StockShortage } from '../lib/api';
-import { CartLineNotice, CheckoutFailureNotice, CheckoutFields } from './CheckoutParts';
+import { BillingLines, CartLineNotice, CheckoutFailureNotice, CheckoutFields, FreeDeliveryHint } from './CheckoutParts';
 import { BulkDiscountProgress } from './BulkDiscountProgress';
 
 interface CartDrawerProps {
@@ -65,6 +65,8 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
   if (!isOpen) return null;
 
   const {
+    subtotal,
+    deliveryFee,
     total: totalAmount,
     mrpTotal: totalOriginal,
     savings: totalSavings,
@@ -278,8 +280,13 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
                   </div>
                 </>
               ) : null}
+              <BillingLines subtotal={subtotal} deliveryFee={deliveryFee} className="pt-1 border-t border-neutral-100" />
+              <FreeDeliveryHint totals={totals} className="mt-1" />
               <div className="flex items-center justify-between text-sm font-black text-slate-900 pt-1 border-t border-neutral-100">
-                <span>Net Payable</span>
+                <span>
+                  Net Payable
+                  <span className="block text-[10px] font-bold text-emerald-600">{NO_TAX_NOTE}</span>
+                </span>
                 <span className="text-base">₹{formatRupees(totalAmount)}</span>
               </div>
             </div>

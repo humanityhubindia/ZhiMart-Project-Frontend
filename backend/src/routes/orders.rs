@@ -14,6 +14,10 @@
 //! offline) and the admin notification is queued here, in the order's own
 //! transaction (transactional outbox). Under `PAYMENT_TEST_MODE` every unit
 //! is charged `TEST_MODE_UNIT_PRICE_PAISE` (₹1) and the order is flagged `is_test`.
+//!
+//! The payable total is the goods ("subtotal", after tier pricing) plus the
+//! delivery charge, which is waived from `FREE_DELIVERY_MIN_RUPEES` up (see
+//! [`Pricing::delivery_fee_for`]); both are decided here, never by the client.
 
 use std::collections::HashSet;
 
@@ -50,6 +54,8 @@ pub const MAX_ORDERS_PER_IP_PER_HOUR: i64 = 10;
 pub const MAX_PENDING_ORDERS_PER_PHONE_PER_DAY: i64 = 5;
 pub const MAX_LINES: usize = 50;
 pub const MAX_QUANTITY: i64 = 1000;
+/// `customer.state` when the client omits it (the store only delivers within Tamil Nadu).
+pub const DEFAULT_STATE: &str = "Tamil Nadu";
 
 /// Public checkout: POST /orders (behind the strict per-IP `orders` limiter).
 pub fn public_routes() -> Router<AppState> {
@@ -79,7 +85,9 @@ pub struct CustomerInput {
     pub email: Option<String>,
     pub address: String,
     pub city: String,
-    pub state: String,
+    /// Optional: missing or blank ⇒ [`DEFAULT_STATE`].
+    #[serde(default)]
+    pub state: Option<String>,
     pub pincode: String,
 }
 
@@ -222,7 +230,7 @@ async fn place(state: &AppState, o: &ValidOrder, meta: &ClientMeta) -> AppResult
     }
 
     let test_mode = state.config.payment_test_mode;
-    let pricing = &state.config.pricing;
+    let pricing = &state.config.effective_pricing();
     let quote = price_lines(&products, &o.lines, pricing)?;
     let pricing_tier = quote.tier;
     let mut lines = Vec::with_capacity(products.len());
@@ -261,6 +269,11 @@ async fn place(state: &AppState, o: &ValidOrder, meta: &ClientMeta) -> AppResult
         });
     }
 
+    // `total` is the goods (subtotal); delivery is decided on what is charged
+    // for them (₹1/unit in test mode, matching the storefront's cart).
+    let delivery_fee = pricing.delivery_fee_for(total);
+    let total = total.checked_add(delivery_fee).ok_or_else(overflow)?;
+
     let new = NewOrder {
         id: Uuid::now_v7(),
         idempotency_key: o.idempotency_key,
@@ -277,6 +290,7 @@ async fn place(state: &AppState, o: &ValidOrder, meta: &ClientMeta) -> AppResult
         item_count,
         mrp_total_paise: mrp_total,
         total_paise: total,
+        delivery_fee_paise: delivery_fee,
         is_test: test_mode,
         pricing_tier,
         online_payment: state.config.payments_enabled,
@@ -428,7 +442,10 @@ fn validate(body: PlaceOrderRequest) -> AppResult<ValidOrder> {
     };
     let address = clean_line(&c.address, "customer.address", 5, 300, true)?;
     let city = clean_line(&c.city, "customer.city", 2, 80, false)?;
-    let state = clean_line(&c.state, "customer.state", 2, 80, false)?;
+    let state = match c.state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => DEFAULT_STATE.to_owned(),
+        Some(s) => clean_line(s, "customer.state", 2, 80, false)?,
+    };
     let pincode = c.pincode.trim();
     if !is_pincode(pincode) {
         return Err(invalid(
@@ -740,8 +757,9 @@ mod tests {
         let lines = [("a".to_owned(), 10), ("b".to_owned(), 2)];
         let q = price_lines(&products, &lines, &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Standard);
-        // ₹63 (30 % of MRP), and ₹165 (only 45 % off, so the list price stays).
-        assert_eq!(q.unit_prices, vec![6_300, 16_500]);
+        // ₹53 (25 % of MRP ₹210 = ₹52.50, rounded up), and ₹165 (only 45 %
+        // off, so the list price stays).
+        assert_eq!(q.unit_prices, vec![5_300, 16_500]);
     }
 
     #[test]
@@ -758,7 +776,7 @@ mod tests {
         let lines = [("a".to_owned(), 249), ("b".to_owned(), 2)];
         let q = price_lines(&products, &lines, &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Standard);
-        assert_eq!(q.unit_prices, vec![6_300, 150_000]);
+        assert_eq!(q.unit_prices, vec![5_300, 125_000]);
     }
 
     #[test]
@@ -771,6 +789,40 @@ mod tests {
         let q = price_lines(&products, &[("a".to_owned(), 1)], &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Bulk);
         assert_eq!(q.unit_prices, vec![3_200]);
+    }
+
+    fn request(customer: serde_json::Value) -> PlaceOrderRequest {
+        serde_json::from_value(serde_json::json!({
+            "idempotencyKey": "0199b5f2-7c1e-7b1a-9d1e-1f2a3b4c5d6e",
+            "customer": customer,
+            "items": [{ "productId": "zm-01", "quantity": 1 }],
+        }))
+        .expect("request")
+    }
+
+    #[test]
+    fn state_defaults_to_tamil_nadu() {
+        let base = serde_json::json!({
+            "name": "Ravi", "phone": "9840012345", "email": "ravi@example.com",
+            "address": "12 Main St", "city": "Chennai", "pincode": "600028",
+        });
+        let missing = validate(request(base.clone())).expect("valid");
+        assert_eq!(missing.state, "Tamil Nadu");
+        for blank in [
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::Value::Null,
+        ] {
+            let mut c = base.clone();
+            c["state"] = blank;
+            assert_eq!(validate(request(c)).expect("valid").state, "Tamil Nadu");
+        }
+        let mut c = base.clone();
+        c["state"] = serde_json::json!("  Kerala ");
+        assert_eq!(validate(request(c)).expect("valid").state, "Kerala");
+        let mut c = base;
+        c["state"] = serde_json::json!("K");
+        assert!(validate(request(c)).is_err(), "too short");
     }
 
     #[test]

@@ -158,9 +158,12 @@ struct ProductList {
     pricing: PricingInfo,
 }
 
-/// The two-tier pricing rule, for the storefront (`GET /products`,
-/// `GET /storefront/config`): `{ "bulkMinOrder": 10000, "bulkDiscountPercent": 85,
-/// "standardDiscountPercent": 70 }` (rupees / whole percents).
+/// The two-tier pricing rule and the delivery charge, for the storefront
+/// (`GET /products`, `GET /storefront/config`): `{ "bulkMinOrder": 10000,
+/// "bulkDiscountPercent": 85, "standardDiscountPercent": 75, "deliveryFee": 350,
+/// "freeDeliveryMin": 5000 }` (rupees / whole percents). Built from
+/// [`crate::config::Config::effective_pricing`], so in payment test mode
+/// `deliveryFee` is what test orders are charged (₹1).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PricingInfo {
@@ -168,6 +171,12 @@ pub struct PricingInfo {
     pub bulk_min_order: i64,
     pub bulk_discount_percent: u32,
     pub standard_discount_percent: u32,
+    /// Charged when the subtotal is below `free_delivery_min`.
+    #[serde(serialize_with = "money::serialize_rupees")]
+    pub delivery_fee: i64,
+    /// Subtotal from which delivery is free (inclusive); 0 = always free.
+    #[serde(serialize_with = "money::serialize_rupees")]
+    pub free_delivery_min: i64,
 }
 
 impl From<&Pricing> for PricingInfo {
@@ -176,6 +185,8 @@ impl From<&Pricing> for PricingInfo {
             bulk_min_order: p.bulk_min_order_paise,
             bulk_discount_percent: p.bulk_discount_percent,
             standard_discount_percent: p.standard_discount_percent,
+            delivery_fee: p.delivery_fee_paise,
+            free_delivery_min: p.free_delivery_min_paise,
         }
     }
 }
@@ -220,7 +231,7 @@ async fn list_products(State(state): State<AppState>) -> AppResult<Response> {
     Ok(cacheable(ProductList {
         products,
         test_mode,
-        pricing: pricing.into(),
+        pricing: (&state.config.effective_pricing()).into(),
     }))
 }
 

@@ -343,7 +343,7 @@ export const ProductPage: React.FC<ProductPageProps> = ({
                 Direct Sivakasi Factory Parcel Dispatch
               </p>
               <p className="text-amber-800 leading-relaxed text-[11px]">
-                Packed in heavy unbleached safety cartons. Delivered safely to all transport hubs across India with parcel tracking docket.
+                Packed in heavy unbleached safety cartons. Delivered safely to transport hubs across Tamil Nadu with parcel tracking docket.
               </p>
             </div>
           </div>

@@ -26,7 +26,7 @@ macro_rules! order_cols {
          transport_partner, docket_number, dispatched_at, delivered_at, cancelled_at, \
          cancel_reason, version, created_at, updated_at, is_test, payment_expires_at, \
          razorpay_order_id, razorpay_payment_id, payment_instrument, amount_refunded_paise, \
-         payment_attention, pricing_tier"
+         payment_attention, pricing_tier, delivery_fee_paise"
     };
 }
 
@@ -160,6 +160,7 @@ pub struct OrderRow {
     pub notes: Option<String>,
     pub item_count: i32,
     pub mrp_total_paise: i64,
+    /// Payable amount: goods (sum of line totals) + `delivery_fee_paise`.
     pub total_paise: i64,
     pub status: String,
     pub payment_method: String,
@@ -185,6 +186,16 @@ pub struct OrderRow {
     pub payment_attention: Option<String>,
     /// `bulk` | `standard`.
     pub pricing_tier: String,
+    /// Delivery charge included in `total_paise` (0 = free delivery).
+    pub delivery_fee_paise: i64,
+}
+
+impl OrderRow {
+    /// Goods total after tier pricing (= sum of the line totals): the payable
+    /// total without the delivery charge.
+    pub fn subtotal_paise(&self) -> i64 {
+        self.total_paise - self.delivery_fee_paise
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -286,6 +297,13 @@ pub struct Order {
     pub item_count: i32,
     #[serde(serialize_with = "serialize_rupees")]
     pub mrp_total: i64,
+    /// Goods after tier pricing.
+    #[serde(serialize_with = "serialize_rupees")]
+    pub subtotal: i64,
+    /// 0 = free delivery.
+    #[serde(serialize_with = "serialize_rupees")]
+    pub delivery_fee: i64,
+    /// Payable: `subtotal + delivery_fee`.
     #[serde(serialize_with = "serialize_rupees")]
     pub total_amount: i64,
     pub status: String,
@@ -301,6 +319,7 @@ pub struct Order {
 
 impl Order {
     pub fn from_parts(r: OrderRow, items: Vec<OrderItem>) -> Self {
+        let subtotal = r.subtotal_paise();
         Order {
             id: r.id,
             order_number: r.order_number,
@@ -320,6 +339,8 @@ impl Order {
             items,
             item_count: r.item_count,
             mrp_total: r.mrp_total_paise,
+            subtotal,
+            delivery_fee: r.delivery_fee_paise,
             total_amount: r.total_paise,
             status: r.status,
             payment: Payment {
@@ -359,6 +380,13 @@ pub struct PublicOrder {
     pub is_test: bool,
     /// `bulk` | `standard`.
     pub pricing_tier: String,
+    /// Goods after tier pricing.
+    #[serde(serialize_with = "serialize_rupees")]
+    pub subtotal: i64,
+    /// 0 = free delivery.
+    #[serde(serialize_with = "serialize_rupees")]
+    pub delivery_fee: i64,
+    /// Payable: `subtotal + delivery_fee`.
     #[serde(serialize_with = "serialize_rupees")]
     pub total_amount: i64,
     #[serde(serialize_with = "serialize_rupees")]
@@ -370,12 +398,15 @@ pub struct PublicOrder {
 
 impl PublicOrder {
     pub fn from_parts(r: OrderRow, items: Vec<OrderItemRow>) -> Self {
+        let subtotal = r.subtotal_paise();
         PublicOrder {
             order_number: r.order_number,
             status: r.status,
             payment_expires_at: r.payment_expires_at,
             is_test: r.is_test,
             pricing_tier: r.pricing_tier,
+            subtotal,
+            delivery_fee: r.delivery_fee_paise,
             total_amount: r.total_paise,
             mrp_total: r.mrp_total_paise,
             item_count: r.item_count,
@@ -690,7 +721,10 @@ pub struct NewOrder<'a> {
     pub user_agent: Option<&'a str>,
     pub item_count: i32,
     pub mrp_total_paise: i64,
+    /// Payable: the line totals + `delivery_fee_paise` (cross-checked against SQL).
     pub total_paise: i64,
+    /// Delivery charge decided by the caller (0 = free delivery).
+    pub delivery_fee_paise: i64,
     /// Placed under `PAYMENT_TEST_MODE` (lines priced at ₹1/unit by the caller).
     pub is_test: bool,
     /// Tier the lines were priced at by the caller.
@@ -787,18 +821,18 @@ pub async fn insert_order(
                 address_line, city, state, pincode, notes, client_ip, user_agent,
                 item_count, mrp_total_paise, total_paise,
                 status, payment_method, payment_status, is_test, payment_expires_at,
-                pricing_tier
+                pricing_tier, delivery_fee_paise
             )
             VALUES (
                 $1,
                 'ZM-' || to_char(now() AT TIME ZONE 'Asia/Kolkata', 'YYMMDD') || '-' || nextval('order_number_seq'),
                 $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                (SELECT sum(unit_price * quantity) FROM lines)::bigint,
+                (SELECT sum(unit_price * quantity) FROM lines)::bigint + $25,
                 CASE WHEN $23 THEN 'pending_payment' ELSE 'pending_pack' END,
                 CASE WHEN $23 THEN 'razorpay' ELSE 'pay_later' END,
                 'pending', $21,
                 CASE WHEN $23 THEN now() + make_interval(secs => $22) END,
-                $24
+                $24, $25
             )
             RETURNING "#,
         order_cols!(),
@@ -847,6 +881,7 @@ pub async fn insert_order(
     .bind(o.payment_expiry.as_secs_f64())
     .bind(o.online_payment)
     .bind(o.pricing_tier.as_str())
+    .bind(o.delivery_fee_paise)
     .fetch_one(conn)
     .await?;
 

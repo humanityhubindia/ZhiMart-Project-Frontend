@@ -109,9 +109,10 @@ pub struct Config {
     /// (`CUSTOMER_ORDER_EMAIL_ENABLED`, default true).
     pub customer_order_emails_enabled: bool,
 
-    // Pricing tiers
+    // Pricing tiers + delivery charge
     /// Two-tier pricing (`BULK_MIN_ORDER_RUPEES`, `STANDARD_DISCOUNT_PERCENT`,
-    /// `BULK_DISCOUNT_PERCENT`).
+    /// `BULK_DISCOUNT_PERCENT`) and the delivery charge (`DELIVERY_FEE_RUPEES`,
+    /// `FREE_DELIVERY_MIN_RUPEES`).
     pub pricing: Pricing,
 }
 
@@ -119,22 +120,33 @@ pub struct Config {
 /// (`products.price_paise`) reaches `bulk_min_order_paise` is charged those
 /// prices ("bulk"); a smaller order pays the "standard" price on every line
 /// (MRP less `standard_discount_percent`, see [`crate::money::standard_price_paise`]).
+///
+/// On top of the goods ("subtotal", after tier pricing) every order pays a flat
+/// `delivery_fee_paise` unless its subtotal reaches `free_delivery_min_paise`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pricing {
     /// Minimum order value, at price-list prices, for bulk pricing (paise).
     pub bulk_min_order_paise: i64,
-    /// Discount off MRP for orders below the bulk minimum (e.g. 70 ⇒ pay 30 % of MRP).
+    /// Discount off MRP for orders below the bulk minimum (e.g. 75 ⇒ pay 25 % of MRP).
     pub standard_discount_percent: u32,
     /// Typical discount of the price list; a label for the storefront only.
     pub bulk_discount_percent: u32,
+    /// Flat delivery charge for an order whose subtotal is below
+    /// `free_delivery_min_paise` (paise).
+    pub delivery_fee_paise: i64,
+    /// Subtotal (after tier pricing) from which delivery is free, inclusive
+    /// (paise). 0 ⇒ delivery is always free.
+    pub free_delivery_min_paise: i64,
 }
 
 impl Default for Pricing {
     fn default() -> Self {
         Pricing {
             bulk_min_order_paise: 10_000 * 100,
-            standard_discount_percent: 70,
+            standard_discount_percent: 75,
             bulk_discount_percent: 85,
+            delivery_fee_paise: 350 * 100,
+            free_delivery_min_paise: 5_000 * 100,
         }
     }
 }
@@ -142,6 +154,8 @@ impl Default for Pricing {
 impl Pricing {
     /// Largest accepted `BULK_MIN_ORDER_RUPEES` (₹1 crore).
     pub const MAX_BULK_MIN_ORDER_RUPEES: i64 = 10_000_000;
+    /// Largest accepted `DELIVERY_FEE_RUPEES` (₹10,000).
+    pub const MAX_DELIVERY_FEE_RUPEES: i64 = 10_000;
 
     /// Unit price for an order that does not qualify for bulk pricing.
     pub fn standard_price_paise(&self, price_paise: i64, mrp_paise: i64) -> i64 {
@@ -151,6 +165,17 @@ impl Pricing {
     /// Whether an order worth `list_total_paise` at price-list prices gets them.
     pub fn is_bulk(&self, list_total_paise: i64) -> bool {
         list_total_paise >= self.bulk_min_order_paise
+    }
+
+    /// Delivery charge for an order whose goods come to `subtotal_paise`
+    /// (after tier pricing): free from `free_delivery_min_paise` (inclusive),
+    /// else the flat fee.
+    pub fn delivery_fee_for(&self, subtotal_paise: i64) -> i64 {
+        if subtotal_paise >= self.free_delivery_min_paise {
+            0
+        } else {
+            self.delivery_fee_paise
+        }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -170,6 +195,16 @@ impl Pricing {
         ensure!(
             self.standard_discount_percent <= self.bulk_discount_percent,
             "STANDARD_DISCOUNT_PERCENT must not exceed BULK_DISCOUNT_PERCENT (bulk orders get the bigger discount)"
+        );
+        ensure!(
+            (0..=Self::MAX_DELIVERY_FEE_RUPEES * 100).contains(&self.delivery_fee_paise),
+            "DELIVERY_FEE_RUPEES must be between 0 and {}",
+            Self::MAX_DELIVERY_FEE_RUPEES
+        );
+        ensure!(
+            (0..=Self::MAX_BULK_MIN_ORDER_RUPEES * 100).contains(&self.free_delivery_min_paise),
+            "FREE_DELIVERY_MIN_RUPEES must be between 0 and {}",
+            Self::MAX_BULK_MIN_ORDER_RUPEES
         );
         Ok(())
     }
@@ -303,8 +338,14 @@ impl Config {
                 bulk_min_order_paise: parse_or::<i64>("BULK_MIN_ORDER_RUPEES", "10000")?
                     .checked_mul(100)
                     .context("BULK_MIN_ORDER_RUPEES is out of range")?,
-                standard_discount_percent: parse_or("STANDARD_DISCOUNT_PERCENT", "70")?,
+                standard_discount_percent: parse_or("STANDARD_DISCOUNT_PERCENT", "75")?,
                 bulk_discount_percent: parse_or("BULK_DISCOUNT_PERCENT", "85")?,
+                delivery_fee_paise: parse_or::<i64>("DELIVERY_FEE_RUPEES", "350")?
+                    .checked_mul(100)
+                    .context("DELIVERY_FEE_RUPEES is out of range")?,
+                free_delivery_min_paise: parse_or::<i64>("FREE_DELIVERY_MIN_RUPEES", "5000")?
+                    .checked_mul(100)
+                    .context("FREE_DELIVERY_MIN_RUPEES is out of range")?,
             },
         };
 
@@ -492,6 +533,18 @@ impl Config {
         )
     }
 
+    /// The pricing actually charged (and published to the storefront). Under
+    /// `PAYMENT_TEST_MODE` the delivery charge is capped at
+    /// [`TEST_MODE_UNIT_PRICE_PAISE`] (₹1) like every unit price, so test
+    /// payments stay cheap but still exercise the delivery line.
+    pub fn effective_pricing(&self) -> Pricing {
+        let mut p = self.pricing;
+        if self.payment_test_mode {
+            p.delivery_fee_paise = p.delivery_fee_paise.min(TEST_MODE_UNIT_PRICE_PAISE);
+        }
+        p
+    }
+
     /// `true` when the configured Razorpay keys are test-mode keys (no real money moves).
     pub fn razorpay_is_test_key(&self) -> bool {
         self.razorpay_key_id.starts_with("rzp_test_")
@@ -538,7 +591,25 @@ mod tests {
         assert_eq!(p.bulk_min_order_paise, 1_000_000);
         assert!(p.is_bulk(1_000_000), "exactly ₹10,000 is bulk");
         assert!(!p.is_bulk(999_999));
-        assert_eq!(p.standard_price_paise(3_200, 21_000), 6_300);
+        // 75 % off MRP ₹210 = ₹52.50 → ₹53.
+        assert_eq!(p.standard_discount_percent, 75);
+        assert_eq!(p.standard_price_paise(3_200, 21_000), 5_300);
+    }
+
+    #[test]
+    fn delivery_fee_below_free_minimum_only() {
+        let p = Pricing::default();
+        assert_eq!(p.delivery_fee_paise, 35_000);
+        assert_eq!(p.free_delivery_min_paise, 500_000);
+        assert_eq!(p.delivery_fee_for(100), 35_000);
+        assert_eq!(p.delivery_fee_for(499_999), 35_000);
+        assert_eq!(p.delivery_fee_for(500_000), 0, "exactly ₹5,000 ships free");
+        assert_eq!(p.delivery_fee_for(1_000_000), 0);
+        let always_free = Pricing {
+            free_delivery_min_paise: 0,
+            ..p
+        };
+        assert_eq!(always_free.delivery_fee_for(100), 0);
     }
 
     #[test]
@@ -566,6 +637,22 @@ mod tests {
                 standard_discount_percent: 90,
                 ..ok
             },
+            Pricing {
+                delivery_fee_paise: -1,
+                ..ok
+            },
+            Pricing {
+                delivery_fee_paise: (Pricing::MAX_DELIVERY_FEE_RUPEES + 1) * 100,
+                ..ok
+            },
+            Pricing {
+                free_delivery_min_paise: -100,
+                ..ok
+            },
+            Pricing {
+                free_delivery_min_paise: (Pricing::MAX_BULK_MIN_ORDER_RUPEES + 1) * 100,
+                ..ok
+            },
         ];
         for p in bad {
             assert!(p.validate().is_err(), "{p:?}");
@@ -578,6 +665,16 @@ mod tests {
             .validate()
             .is_ok(),
             "0 = always bulk"
+        );
+        assert!(
+            Pricing {
+                delivery_fee_paise: 0,
+                free_delivery_min_paise: 0,
+                ..ok
+            }
+            .validate()
+            .is_ok(),
+            "no delivery charge"
         );
     }
 }

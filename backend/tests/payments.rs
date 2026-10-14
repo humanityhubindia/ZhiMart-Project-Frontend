@@ -699,7 +699,8 @@ async fn storefront_config_is_public_and_cacheable(pool: PgPool) {
         r.body,
         json!({ "testMode": false, "onlinePaymentsEnabled": true, "razorpayKeyId": KEY_ID, "currency": "INR",
                 "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks",
-                "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 70 } })
+                "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75,
+                             "deliveryFee": 350, "freeDeliveryMin": 5000 } })
     );
     assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=60");
 }
@@ -743,6 +744,61 @@ async fn pay_creates_razorpay_order_once_and_reuses_it(pool: PgPool) {
         h.row(o.id).await.razorpay_order_id.as_deref(),
         Some(oid.as_str())
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delivery_fee_is_part_of_the_payable_amount(pool: PgPool) {
+    const FEE: i64 = 35_000;
+    let h = setup(pool).await;
+    let o = h.seed_order().await;
+    sqlx::query(
+        "UPDATE orders SET delivery_fee_paise = $2, total_paise = total_paise + $2 WHERE id = $1",
+    )
+    .bind(o.id)
+    .bind(FEE)
+    .execute(&h.pool)
+    .await
+    .expect("add delivery fee");
+
+    let g = h
+        .guest(
+            Method::GET,
+            &format!("/api/v1/orders/{}", o.number),
+            &o.token,
+            None,
+        )
+        .await;
+    assert_eq!(g.status, StatusCode::OK);
+    assert_eq!(g.body["subtotal"], 1650);
+    assert_eq!(g.body["deliveryFee"], 350);
+    assert_eq!(g.body["totalAmount"], 2000);
+
+    // Razorpay is asked for goods + delivery, and only that amount verifies.
+    let p = h.pay(&o).await;
+    assert_eq!(p.status, StatusCode::OK, "{}", p.body);
+    assert_eq!(p.body["amountPaise"], TOTAL + FEE);
+    let oid = p.body["razorpayOrderId"].as_str().expect("id").to_owned();
+    h.mock
+        .add_payment("pay_Delivery001", &oid, TOTAL + FEE, "captured");
+    let r = h.verify_signed(&o, &oid, "pay_Delivery001").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["payment"]["status"], "paid");
+    assert_eq!(r.body["totalAmount"], 2000);
+
+    // A full refund returns the delivery charge too.
+    let v = h.row(o.id).await.version;
+    let r = h
+        .admin(
+            Method::POST,
+            &format!("/api/v1/admin/orders/{}/refund", o.id),
+            Some(json!({ "amount": null, "reason": "Customer request", "expectedVersion": v })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["payment"]["amountRefunded"], 2000);
+    assert_eq!(r.body["subtotal"], 1650);
+    assert_eq!(r.body["deliveryFee"], 350);
+    assert_eq!(h.row(o.id).await.amount_refunded_paise, TOTAL + FEE);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -840,6 +896,11 @@ async fn wrong_or_missing_token_is_404(pool: PgPool) {
     assert_eq!(g.body["customerName"], "Test Customer");
     assert_eq!(g.body["city"], "Chennai");
     assert_eq!(g.body["totalAmount"], 1650);
+    assert_eq!(g.body["subtotal"], 1650);
+    assert_eq!(
+        g.body["deliveryFee"], 0,
+        "column default: pre-migration orders shipped free"
+    );
     // Seeded with plain SQL: the column default (pre-migration orders were all bulk).
     assert_eq!(g.body["pricingTier"], "bulk");
     assert_eq!(

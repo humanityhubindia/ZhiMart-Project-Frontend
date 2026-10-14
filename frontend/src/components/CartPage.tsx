@@ -25,9 +25,9 @@ import {
   EMPTY_CHECKOUT_FORM,
   validateCheckout,
 } from '../lib/checkout';
-import { computeTotals, formatRupees, hasBulkThreshold, lineTotal, unitPriceFor } from '../lib/money';
+import { computeTotals, formatRupees, hasBulkThreshold, lineTotal, NO_TAX_NOTE, unitPriceFor } from '../lib/money';
 import { StockShortage } from '../lib/api';
-import { CartLineNotice, CheckoutFailureNotice, CheckoutFields } from './CheckoutParts';
+import { BillingLines, CartLineNotice, CheckoutFailureNotice, CheckoutFields, FreeDeliveryHint } from './CheckoutParts';
 import { BulkDiscountProgress } from './BulkDiscountProgress';
 
 interface CartPageProps {
@@ -76,6 +76,8 @@ export const CartPage: React.FC<CartPageProps> = ({
   const pricing = usePricingRules();
   const totals = useMemo(() => computeTotals(cartItems, pricing), [cartItems, pricing]);
   const {
+    subtotal,
+    deliveryFee,
     total: totalAmount,
     mrpTotal: totalOriginal,
     savings: totalSavings,
@@ -384,7 +386,7 @@ export const CartPage: React.FC<CartPageProps> = ({
                   {testMode ? (
                     <div className="flex items-center justify-between text-amber-700 font-bold">
                       <span>Test price ({totalItemUnits} units × ₹1)</span>
-                      <span>₹{formatRupees(totalAmount)}</span>
+                      <span>₹{formatRupees(subtotal)}</span>
                     </div>
                   ) : (
                     <>
@@ -424,15 +426,18 @@ export const CartPage: React.FC<CartPageProps> = ({
                     <span className="text-emerald-600 font-bold">FREE</span>
                   </div>
 
-                  <div className="flex items-center justify-between text-slate-600 font-medium">
-                    <span>Dispatch Transport</span>
-                    <span className="text-slate-800 font-semibold">Factory Direct</span>
-                  </div>
+                  <BillingLines
+                    subtotal={subtotal}
+                    deliveryFee={deliveryFee}
+                    className="border-t border-slate-100 pt-2"
+                  />
+
+                  <FreeDeliveryHint totals={totals} />
 
                   <div className="border-t border-slate-200 pt-3 flex items-baseline justify-between">
                     <div>
                       <span className="text-xs font-bold text-slate-500 block">Total Net Payable</span>
-                      <span className="text-[11px] text-emerald-600 font-bold">Inclusive of all taxes</span>
+                      <span className="text-[11px] text-emerald-600 font-bold">{NO_TAX_NOTE}</span>
                     </div>
                     <span className="text-2xl font-black text-slate-900">
                       ₹{formatRupees(totalAmount)}

@@ -166,6 +166,13 @@ struct GuestOrder {
     created_at: DateTime<Utc>,
     payment_expires_at: Option<DateTime<Utc>>,
     payment: GuestPayment,
+    /// Goods after tier pricing.
+    #[serde(serialize_with = "serialize_rupees")]
+    subtotal: i64,
+    /// 0 = free delivery.
+    #[serde(serialize_with = "serialize_rupees")]
+    delivery_fee: i64,
+    /// Payable: `subtotal + delivery_fee`.
     #[serde(serialize_with = "serialize_rupees")]
     total_amount: i64,
     #[serde(serialize_with = "serialize_rupees")]
@@ -276,6 +283,7 @@ async fn load_guest_order(
 async fn guest_view(state: &AppState, row: OrderRow) -> AppResult<GuestOrder> {
     let items = repo::orders::items_for(&state.db, &[row.id]).await?;
     let pending = row.status == "pending_payment";
+    let subtotal = row.subtotal_paise();
     Ok(GuestOrder {
         order_number: row.order_number,
         status: row.status,
@@ -293,6 +301,8 @@ async fn guest_view(state: &AppState, row: OrderRow) -> AppResult<GuestOrder> {
             instrument: row.payment_instrument,
             paid_at: row.paid_at,
         },
+        subtotal,
+        delivery_fee: row.delivery_fee_paise,
         total_amount: row.total_paise,
         mrp_total: row.mrp_total_paise,
         item_count: row.item_count,
@@ -329,7 +339,7 @@ async fn storefront_config(State(state): State<AppState>) -> Response {
         currency: "INR",
         payment_expiry_minutes: c.payment_expiry.as_secs() / 60,
         store_name: &c.store_name,
-        pricing: (&c.pricing).into(),
+        pricing: (&c.effective_pricing()).into(),
     })
     .into_response();
     res.headers_mut().insert(

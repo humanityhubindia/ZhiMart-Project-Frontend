@@ -290,12 +290,19 @@ async fn seed_2026_catalog_is_present(pool: PgPool) {
     assert_eq!(num(&first["price"]), 32.0);
     assert_eq!(num(&first["originalPrice"]), 210.0);
     assert_eq!(first["discountPercent"], 85);
-    assert_eq!(num(&first["standardPrice"]), 63.0, "70% off MRP ₹210");
-    assert_eq!(first["standardDiscountPercent"], 70);
+    assert_eq!(
+        num(&first["standardPrice"]),
+        53.0,
+        "75% off MRP ₹210 = ₹52.50, rounded up"
+    );
+    assert_eq!(first["standardDiscountPercent"], 75);
     assert_eq!(first["inStock"], true);
     assert_eq!(
         r.body["pricing"],
-        json!({ "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 70 })
+        json!({
+            "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75,
+            "deliveryFee": 350, "freeDeliveryMin": 5000
+        })
     );
 
     let big = products
@@ -305,7 +312,7 @@ async fn seed_2026_catalog_is_present(pool: PgPool) {
     assert_eq!(big["name"], "Shubh Vivah 10 X 10 Multi Colour");
     assert_eq!(num(&big["price"]), 6000.0);
     assert_eq!(num(&big["originalPrice"]), 40000.0);
-    assert_eq!(num(&big["standardPrice"]), 12000.0);
+    assert_eq!(num(&big["standardPrice"]), 10000.0);
 
     let gift = products.last().expect("gift box");
     assert_eq!(gift["id"], "zm26-gift-60");
@@ -854,6 +861,8 @@ async fn live_mode_shows_real_prices(pool: PgPool) {
     assert_eq!(num(&one.body["standardPrice"]), 165.0);
     assert_eq!(one.body["standardDiscountPercent"], 45);
     assert_eq!(r.body["pricing"]["bulkMinOrder"], 10000);
+    assert_eq!(r.body["pricing"]["deliveryFee"], 350);
+    assert_eq!(r.body["pricing"]["freeDeliveryMin"], 5000);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -879,6 +888,9 @@ async fn test_mode_prices_storefront_at_one_rupee_but_not_admin(pool: PgPool) {
     }
     assert_eq!(num(&products[0]["originalPrice"]), 373.0);
     assert_eq!(products[0]["discountPercent"], 100);
+    // Test orders pay ₹1 for delivery (when not free), like every unit.
+    assert_eq!(r.body["pricing"]["deliveryFee"], 1);
+    assert_eq!(r.body["pricing"]["freeDeliveryMin"], 5000);
 
     let one = h.public("/products/zm-03").await;
     assert_eq!(num(&one.body["price"]), 1.0);
