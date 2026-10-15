@@ -1,5 +1,4 @@
-import React, { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import React from 'react';
 import {
   Truck,
   MapPin,
@@ -9,9 +8,6 @@ import {
   Bot,
   Percent,
   CheckCircle2,
-  Clock,
-  Building2,
-  BadgeCheck,
 } from 'lucide-react';
 import { HeroCrackers } from '../lib/crackerPop';
 
@@ -21,58 +17,11 @@ interface HeroSectionProps {
   onOpenAIAssistant: () => void;
 }
 
-interface TrustedPerson {
-  id: string;
-  image: string;
-  title: string;
-  badge: string;
-  subtitle: string;
-  quote: string;
-  highlight: string;
-  objectPosition: string;
-}
-
-const TRUSTED_PERSONS: TrustedPerson[] = [
-  {
-    id: 'person-1',
-    image: '/assets/founders/founder_senior.jpg',
-    title: 'Trusted By Them',
-    badge: 'Trusted By Them',
-    subtitle: '30+ Years Sivakasi Trust',
-    quote: '“Direct from Sivakasi manufacturing units with authentic green fireworks certification and genuine factory wholesale rates.”',
-    highlight: 'Sivakasi Industry Veteran',
-    objectPosition: 'object-center',
-  },
-  {
-    id: 'person-2',
-    image: '/assets/founders/founder_young.jpg',
-    title: 'Trusted By Them',
-    badge: 'Trusted By Them',
-    subtitle: 'Factory-Direct Patron',
-    quote: '“Zero retail markups and transparent pricing — Sivakasi’s freshest crackers safely delivered, free on orders of ₹5,000+.”',
-    highlight: 'Direct-To-Home Advocate',
-    objectPosition: 'object-center',
-  },
-];
-
 export const HeroSection: React.FC<HeroSectionProps> = ({
   onExploreProducts,
   onOpenQuickEstimate,
   onOpenAIAssistant,
 }) => {
-  const [currentIdx, setCurrentIdx] = useState(0);
-  const [isPaused, setIsPaused] = useState(false);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const timer = setInterval(() => {
-      setCurrentIdx((prev) => (prev + 1) % TRUSTED_PERSONS.length);
-    }, 4000);
-    return () => clearInterval(timer);
-  }, [isPaused]);
-
-  const currentPerson = TRUSTED_PERSONS[currentIdx];
-
   return (
     <section className="relative isolate w-full bg-gradient-to-b from-white via-slate-50/70 to-[#F8F9FA] border-b border-slate-200/80 pt-10 pb-14 sm:pt-14 sm:pb-16 px-4 sm:px-6 lg:px-8 text-left">
       {/* Occasional Diwali cracker pops — behind the content, never blocks clicks */}
@@ -85,7 +34,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
           <div className="md:col-span-7 space-y-6">
             {/* Top Festive Badge & Unified Pill */}
             <div className="flex flex-wrap items-center gap-2.5">
-              <div className="inline-flex items-center bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-white px-3.5 py-1.5 rounded-full text-xs font-black shadow-xs tracking-wide">
+              <div className="inline-flex items-center gap-2 bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-white px-3.5 py-1.5 rounded-full text-xs font-black shadow-xs tracking-wide">
                 <span>Diwali Special Discount &bull; Up to 85% OFF</span>
               </div>
               <div className="inline-flex items-center gap-2 bg-slate-950 text-white px-3.5 py-1.5 sm:px-4 sm:py-1.5 rounded-full text-xs font-bold shadow-xs border border-slate-800">
@@ -98,13 +47,20 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               </div>
             </div>
 
-            {/* Main Headline */}
-            <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-5xl font-black text-slate-950 tracking-tight font-heading leading-[1.2]">
+            {/* Main Headline with Highlighted 85% Diwali Discount */}
+            <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-[3.15rem] font-black text-slate-950 tracking-tight font-heading leading-[1.18]">
               Crackers Directly From{' '}
               <span lang="ta" className="font-tamil tracking-normal text-amber-600 text-[0.92em]">
                 சிவகாசி
               </span>{' '}
               With Free Delivery.
+              <span className="block mt-2 sm:mt-3 text-2xl sm:text-3xl md:text-4xl lg:text-[2.6rem] font-black text-slate-950">
+                Diwali Special Discount{' '}
+                <span className="text-amber-600">
+                  Up to 85% OFF
+                </span>
+                .
+              </span>
             </h1>
 
             {/* Sub-headline */}
@@ -163,70 +119,42 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
             </div>
           </div>
 
-          {/* Right Column (5 cols): Dynamic Image Only - Comes & Goes */}
+          {/* Right Column (5 cols): Young Patron Showcase (founder_senior removed) */}
           <div className="md:col-span-5 flex items-center justify-center md:justify-end w-full">
-            <div
-              className="relative w-full max-w-[340px] sm:max-w-[380px] lg:max-w-[420px] aspect-[4/5] rounded-3xl overflow-hidden shadow-2xl shadow-slate-900/15 border border-slate-200/80 bg-slate-950 group"
-              onMouseEnter={() => setIsPaused(true)}
-              onMouseLeave={() => setIsPaused(false)}
-            >
+            <div className="relative w-full max-w-[340px] sm:max-w-[380px] lg:max-w-[420px] aspect-[4/5] rounded-3xl overflow-hidden shadow-2xl shadow-slate-900/15 border border-slate-200/80 bg-slate-950 group">
               {/* Subtle ambient festive glow */}
               <div className="absolute -inset-2 bg-gradient-to-tr from-amber-500/20 via-transparent to-emerald-500/20 blur-xl opacity-60 pointer-events-none" />
 
-              <AnimatePresence mode="wait">
-                <motion.div
-                  key={currentPerson.id}
-                  initial={{ opacity: 0, scale: 0.96 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.96 }}
-                  transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-                  className="relative w-full h-full"
-                >
-                  <img
-                    src={currentPerson.image}
-                    alt={currentPerson.title}
-                    className={`w-full h-full object-cover ${currentPerson.objectPosition}`}
-                  />
+              <div className="relative w-full h-full">
+                <img
+                  src="/assets/founders/founder_young.jpg"
+                  alt="Trusted by them"
+                  className="w-full h-full object-cover object-top group-hover:scale-105 transition-transform duration-700 ease-out"
+                />
 
-                  {/* Gradient shadow for text legibility */}
-                  <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/30 to-transparent pointer-events-none" />
+                {/* Gradient shadow for text legibility */}
+                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/35 to-transparent pointer-events-none" />
 
-                  {/* Top Badge: Trusted by them */}
-                  <div className="absolute top-4 left-4 inline-flex items-center bg-slate-950/80 backdrop-blur-md text-amber-300 text-xs font-black uppercase tracking-wider px-3.5 py-1.5 rounded-full border border-amber-500/30 shadow-lg">
-                    <span>Trusted by them</span>
+                {/* Top Badge: Trusted by them */}
+                <div className="absolute top-4 left-4 inline-flex items-center bg-slate-950/80 backdrop-blur-md text-amber-300 text-xs font-black uppercase tracking-wider px-3.5 py-1.5 rounded-full border border-amber-500/30 shadow-lg">
+                  <span>Trusted by them</span>
+                </div>
+
+                {/* Bottom Text Content */}
+                <div className="absolute bottom-5 inset-x-5 text-left text-white space-y-1.5">
+                  <div className="inline-flex items-center gap-1.5 text-emerald-400 text-xs font-extrabold uppercase tracking-wider">
+                    <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>Direct Sivakasi Hub</span>
                   </div>
 
-                  {/* Bottom Text Content */}
-                  <div className="absolute bottom-5 inset-x-5 text-left text-white space-y-1.5">
-                    <div className="inline-flex items-center gap-1.5 text-emerald-400 text-xs font-extrabold uppercase tracking-wider">
-                      <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span>Direct Sivakasi Hub</span>
-                    </div>
+                  <h3 className="text-xl sm:text-2xl font-black tracking-tight text-white leading-tight">
+                    Trusted by them
+                  </h3>
 
-                    <h3 className="text-xl sm:text-2xl font-black tracking-tight text-white leading-tight">
-                      Trusted by them
-                    </h3>
-
-                    <p className="text-xs sm:text-[13px] text-slate-200 font-medium leading-relaxed">
-                      {currentPerson.quote}
-                    </p>
-                  </div>
-                </motion.div>
-              </AnimatePresence>
-
-              {/* Minimal Slide Indicators */}
-              <div className="absolute top-4 right-4 z-10 flex items-center gap-1.5 bg-slate-950/60 backdrop-blur-md px-2.5 py-1.5 rounded-full border border-white/10">
-                {TRUSTED_PERSONS.map((p, idx) => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() => setCurrentIdx(idx)}
-                    className={`h-1.5 rounded-full transition-all duration-300 ${
-                      currentIdx === idx ? 'w-5 bg-amber-400' : 'w-1.5 bg-white/40 hover:bg-white/70'
-                    }`}
-                    aria-label={`Switch to image ${idx + 1}`}
-                  />
-                ))}
+                  <p className="text-xs sm:text-[13px] text-slate-200 font-medium leading-relaxed">
+                    “Direct from Sivakasi manufacturing units with authentic green fireworks certification, zero retail markups, and genuine factory wholesale rates.”
+                  </p>
+                </div>
               </div>
             </div>
           </div>
