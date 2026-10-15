@@ -104,7 +104,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 ZHI-MART
               </span>
               <span className="text-[9px] sm:text-[10px] font-black uppercase tracking-[0.22em] text-amber-600 leading-none mt-1">
-                Wholesales
+                Wholesale
               </span>
             </div>
           </button>
