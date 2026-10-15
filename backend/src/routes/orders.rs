@@ -757,26 +757,26 @@ mod tests {
         let lines = [("a".to_owned(), 10), ("b".to_owned(), 2)];
         let q = price_lines(&products, &lines, &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Standard);
-        // ₹53 (25 % of MRP ₹210 = ₹52.50, rounded up), and ₹165 (only 45 %
-        // off, so the list price stays).
-        assert_eq!(q.unit_prices, vec![5_300, 16_500]);
+        // ₹42 (20 % of MRP ₹210), and ₹165 (only 45 % off, so the list
+        // price stays).
+        assert_eq!(q.unit_prices, vec![4_200, 16_500]);
     }
 
     #[test]
     fn bulk_threshold_is_inclusive_and_uses_list_prices() {
         let pricing = Pricing::default();
-        let products = [product("a", 3_200, 21_000), product("b", 100_000, 500_000)];
-        // ₹32 × 250 + ₹1,000 × 2 = ₹10,000 exactly → bulk.
-        let lines = [("a".to_owned(), 250), ("b".to_owned(), 2)];
+        let products = [product("a", 3_200, 21_000), product("b", 100_000, 600_000)];
+        // ₹32 × 125 + ₹1,000 × 1 = ₹5,000 exactly → bulk.
+        let lines = [("a".to_owned(), 125), ("b".to_owned(), 1)];
         let q = price_lines(&products, &lines, &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Bulk);
         assert_eq!(q.unit_prices, vec![3_200, 100_000]);
-        // One unit fewer: ₹9,968 → standard, even though standard prices
-        // would push the total well above ₹10,000.
-        let lines = [("a".to_owned(), 249), ("b".to_owned(), 2)];
+        // One unit fewer: ₹4,968 → standard, even though standard prices
+        // would push the total well above ₹5,000.
+        let lines = [("a".to_owned(), 124), ("b".to_owned(), 1)];
         let q = price_lines(&products, &lines, &pricing).expect("quote");
         assert_eq!(q.tier, PricingTier::Standard);
-        assert_eq!(q.unit_prices, vec![5_300, 125_000]);
+        assert_eq!(q.unit_prices, vec![4_200, 120_000]);
     }
 
     #[test]

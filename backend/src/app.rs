@@ -831,6 +831,7 @@ mod tests {
             public_site_url: None,
             customer_order_emails_enabled: false,
             pricing: Default::default(),
+            google_sheets: None,
         }
     }
 

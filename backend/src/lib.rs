@@ -14,5 +14,6 @@ pub mod net;
 pub mod payments;
 pub mod repo;
 pub mod routes;
+pub mod sheets;
 pub mod state;
 pub mod telemetry;

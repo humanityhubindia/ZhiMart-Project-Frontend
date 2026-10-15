@@ -250,7 +250,7 @@ fn html_multiline(text: &str) -> String {
     escape_html(text.trim()).replace('\n', "<br>")
 }
 
-/// "₹350", or "FREE" when the order ships free.
+/// "₹500", or "FREE" when the order ships free.
 pub fn delivery_label(delivery_fee_paise: i64) -> String {
     if delivery_fee_paise > 0 {
         format_inr(delivery_fee_paise)
@@ -263,7 +263,7 @@ pub fn delivery_label(delivery_fee_paise: i64) -> String {
 const TAX_LABEL: &str = "Tax (GST)";
 const TAX_AMOUNT: &str = "₹0";
 
-/// "Bulk price (₹10,000+ order)" / "Standard price (order below ₹10,000)".
+/// "Bulk price (₹5,000+ order)" / "Standard price (order below ₹5,000)".
 /// `bulk_min_order_paise` is the currently configured minimum.
 pub fn pricing_tier_label(tier: &str, bulk_min_order_paise: i64) -> String {
     let min = format_inr(bulk_min_order_paise);
@@ -1149,7 +1149,7 @@ mod tests {
                 body.contains("Subtotal") && body.contains("FREE"),
                 "free delivery"
             );
-            assert!(body.contains("Bulk price (₹10,000+ order)"), "pricing tier");
+            assert!(body.contains("Bulk price (₹5,000+ order)"), "pricing tier");
             assert!(!body.contains("9840012345"), "full phone never shown");
             assert!(
                 !body.contains("pay_XYZ789"),
@@ -1176,7 +1176,7 @@ mod tests {
         o.pricing_tier = "standard".into();
         let e = customer_order_confirmation(&o, &config).expect("rendered");
         for body in [&e.html, &e.text] {
-            assert!(body.contains("Standard price (order below ₹10,000)"));
+            assert!(body.contains("Standard price (order below ₹5,000)"));
         }
 
         o.customer.email = None;

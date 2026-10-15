@@ -3,7 +3,10 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
-use crate::{auth::jwt::JwtKeys, config::Config, email::EmailSender, payments::RazorpayClient};
+use crate::{
+    auth::jwt::JwtKeys, config::Config, email::EmailSender, payments::RazorpayClient,
+    sheets::SheetsClient,
+};
 
 /// Shared application state. Cheap to clone (everything is behind `Arc`/pool handles).
 #[derive(Clone)]
@@ -13,6 +16,9 @@ pub struct AppState {
     pub jwt: Arc<JwtKeys>,
     pub email: Arc<dyn EmailSender>,
     pub razorpay: Arc<RazorpayClient>,
+    /// Google Sheets order sync client; `None` unless `GOOGLE_SHEETS_ENABLED=true`.
+    /// Only the background worker uses it (never a request handler).
+    pub sheets: Option<Arc<SheetsClient>>,
     /// Bounds concurrent Argon2 work so a login flood cannot pin every core.
     pub hash_permits: Arc<Semaphore>,
 }
@@ -25,6 +31,12 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         let jwt = Arc::new(JwtKeys::new(&config)?);
         let razorpay = Arc::new(RazorpayClient::new(&config)?);
+        let sheets = config
+            .google_sheets
+            .as_ref()
+            .map(SheetsClient::new)
+            .transpose()?
+            .map(Arc::new);
         let permits = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
@@ -35,6 +47,7 @@ impl AppState {
             jwt,
             email,
             razorpay,
+            sheets,
             hash_permits: Arc::new(Semaphore::new(permits)),
         })
     }

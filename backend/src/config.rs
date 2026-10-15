@@ -114,6 +114,11 @@ pub struct Config {
     /// `BULK_DISCOUNT_PERCENT`) and the delivery charge (`DELIVERY_FEE_RUPEES`,
     /// `FREE_DELIVERY_MIN_RUPEES`).
     pub pricing: Pricing,
+
+    // Google Sheets order sync
+    /// `Some` when `GOOGLE_SHEETS_ENABLED=true` (all settings then validated
+    /// at startup); `None` ⇒ the sync worker is not started.
+    pub google_sheets: Option<GoogleSheetsConfig>,
 }
 
 /// Two-tier pricing. An order whose total at price-list prices
@@ -127,7 +132,7 @@ pub struct Config {
 pub struct Pricing {
     /// Minimum order value, at price-list prices, for bulk pricing (paise).
     pub bulk_min_order_paise: i64,
-    /// Discount off MRP for orders below the bulk minimum (e.g. 75 ⇒ pay 25 % of MRP).
+    /// Discount off MRP for orders below the bulk minimum (e.g. 80 ⇒ pay 20 % of MRP).
     pub standard_discount_percent: u32,
     /// Typical discount of the price list; a label for the storefront only.
     pub bulk_discount_percent: u32,
@@ -142,10 +147,10 @@ pub struct Pricing {
 impl Default for Pricing {
     fn default() -> Self {
         Pricing {
-            bulk_min_order_paise: 10_000 * 100,
-            standard_discount_percent: 75,
+            bulk_min_order_paise: 5_000 * 100,
+            standard_discount_percent: 80,
             bulk_discount_percent: 85,
-            delivery_fee_paise: 350 * 100,
+            delivery_fee_paise: 500 * 100,
             free_delivery_min_paise: 5_000 * 100,
         }
     }
@@ -210,6 +215,206 @@ impl Pricing {
     }
 }
 
+/// Google OAuth "client" credentials (Cloud Console → APIs & Services →
+/// Credentials). Needed by the sync worker and by the `google-auth` CLI.
+#[derive(Clone)]
+pub struct GoogleOAuthClientConfig {
+    /// `GOOGLE_OAUTH_CLIENT_ID` (`….apps.googleusercontent.com`; not secret).
+    pub client_id: String,
+    /// `GOOGLE_OAUTH_CLIENT_SECRET`.
+    pub client_secret: SecretString,
+    /// Token endpoint (`GOOGLE_OAUTH_TOKEN_URL`; overridable only for tests).
+    pub token_url: String,
+}
+
+impl std::fmt::Debug for GoogleOAuthClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleOAuthClientConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("token_url", &self.token_url)
+            .finish()
+    }
+}
+
+impl GoogleOAuthClientConfig {
+    /// Client ID + secret only (all `google-auth` needs).
+    pub fn from_env() -> anyhow::Result<Self> {
+        let missing: Vec<&str> = ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]
+            .into_iter()
+            .filter(|k| var_or(k, "").trim().is_empty())
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "missing {} (Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 client)",
+            missing.join(", ")
+        );
+        let cfg = GoogleOAuthClientConfig {
+            client_id: var_or("GOOGLE_OAUTH_CLIENT_ID", "").trim().to_owned(),
+            client_secret: SecretString::from(
+                var_or("GOOGLE_OAUTH_CLIENT_SECRET", "").trim().to_owned(),
+            ),
+            token_url: var_or("GOOGLE_OAUTH_TOKEN_URL", GOOGLE_TOKEN_URL)
+                .trim()
+                .to_owned(),
+        };
+        ensure!(
+            cfg.client_id.ends_with(".apps.googleusercontent.com")
+                && !cfg
+                    .client_id
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control()),
+            "GOOGLE_OAUTH_CLIENT_ID must be an OAuth client ID ending in .apps.googleusercontent.com"
+        );
+        ensure!(
+            !cfg.client_secret
+                .expose_secret()
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control()),
+            "GOOGLE_OAUTH_CLIENT_SECRET must not contain spaces"
+        );
+        ensure!(
+            cfg.token_url.starts_with("https://") || cfg.token_url.starts_with("http://"),
+            "GOOGLE_OAUTH_TOKEN_URL must be an http(s) URL"
+        );
+        Ok(cfg)
+    }
+}
+
+/// Google Sheets order sync (`GOOGLE_SHEETS_*`, `GOOGLE_OAUTH_*`). See README
+/// "Google Sheets order sync".
+#[derive(Clone)]
+pub struct GoogleSheetsConfig {
+    pub oauth: GoogleOAuthClientConfig,
+    /// Long-lived OAuth refresh token from `zhimart-backend google-auth`
+    /// (`GOOGLE_OAUTH_REFRESH_TOKEN`).
+    pub refresh_token: SecretString,
+    /// The ID from the sheet URL `…/spreadsheets/d/<ID>/edit`
+    /// (`GOOGLE_SHEETS_SPREADSHEET_ID`; a full URL is accepted too).
+    pub spreadsheet_id: String,
+    /// Tab (sheet) name; created if missing (`GOOGLE_SHEETS_TAB`, default `Orders`).
+    pub tab: String,
+    /// Sheets REST API origin (`GOOGLE_SHEETS_API_BASE`; overridable only for tests).
+    pub api_base: String,
+}
+
+impl std::fmt::Debug for GoogleSheetsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleSheetsConfig")
+            .field("oauth", &self.oauth)
+            .field("refresh_token", &"[redacted]")
+            .field("spreadsheet_id", &self.spreadsheet_id)
+            .field("tab", &self.tab)
+            .field("api_base", &self.api_base)
+            .finish()
+    }
+}
+
+pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub const GOOGLE_SHEETS_API: &str = "https://sheets.googleapis.com";
+pub const GOOGLE_SHEETS_DEFAULT_TAB: &str = "Orders";
+
+impl GoogleSheetsConfig {
+    /// `None` unless `GOOGLE_SHEETS_ENABLED=true`; when enabled every setting
+    /// is required and validated (fail fast at boot).
+    pub fn from_env(app_env: AppEnv) -> anyhow::Result<Option<Self>> {
+        if !parse_or::<bool>("GOOGLE_SHEETS_ENABLED", "false")? {
+            return Ok(None);
+        }
+        Self::load(app_env)
+            .context("GOOGLE_SHEETS_ENABLED=true but the Google Sheets settings are incomplete")
+            .map(Some)
+    }
+
+    /// Read and validate the settings regardless of `GOOGLE_SHEETS_ENABLED`
+    /// (used by `google-sheets-check`).
+    pub fn load(app_env: AppEnv) -> anyhow::Result<Self> {
+        let missing: Vec<&str> = [
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "GOOGLE_OAUTH_CLIENT_SECRET",
+            "GOOGLE_OAUTH_REFRESH_TOKEN",
+            "GOOGLE_SHEETS_SPREADSHEET_ID",
+        ]
+        .into_iter()
+        .filter(|k| var_or(k, "").trim().is_empty())
+        .collect();
+        ensure!(
+            missing.is_empty(),
+            "missing {} (see README \"Google Sheets order sync\"; the refresh token comes from `zhimart-backend google-auth`)",
+            missing.join(", ")
+        );
+        let cfg = GoogleSheetsConfig {
+            oauth: GoogleOAuthClientConfig::from_env()?,
+            refresh_token: SecretString::from(
+                var_or("GOOGLE_OAUTH_REFRESH_TOKEN", "").trim().to_owned(),
+            ),
+            spreadsheet_id: normalize_spreadsheet_id(&var_or("GOOGLE_SHEETS_SPREADSHEET_ID", "")),
+            tab: var_or("GOOGLE_SHEETS_TAB", GOOGLE_SHEETS_DEFAULT_TAB)
+                .trim()
+                .to_owned(),
+            api_base: var_or("GOOGLE_SHEETS_API_BASE", GOOGLE_SHEETS_API)
+                .trim()
+                .trim_end_matches('/')
+                .to_owned(),
+        };
+        cfg.validate(app_env)?;
+        Ok(cfg)
+    }
+
+    fn validate(&self, app_env: AppEnv) -> anyhow::Result<()> {
+        ensure!(
+            !self
+                .refresh_token
+                .expose_secret()
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control()),
+            "GOOGLE_OAUTH_REFRESH_TOKEN must not contain spaces"
+        );
+        ensure!(
+            (20..=128).contains(&self.spreadsheet_id.len())
+                && self
+                    .spreadsheet_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "GOOGLE_SHEETS_SPREADSHEET_ID must be the ID from the sheet URL: https://docs.google.com/spreadsheets/d/<ID>/edit"
+        );
+        ensure!(
+            (1..=100).contains(&self.tab.chars().count())
+                && !self.tab.chars().any(char::is_control),
+            "GOOGLE_SHEETS_TAB must be 1-100 characters"
+        );
+        ensure!(
+            self.api_base.starts_with("https://") || self.api_base.starts_with("http://"),
+            "GOOGLE_SHEETS_API_BASE must be an http(s) URL"
+        );
+        if app_env.is_production() {
+            ensure!(
+                self.oauth.token_url == GOOGLE_TOKEN_URL,
+                "GOOGLE_OAUTH_TOKEN_URL cannot be overridden in production"
+            );
+            ensure!(
+                self.api_base == GOOGLE_SHEETS_API,
+                "GOOGLE_SHEETS_API_BASE cannot be overridden in production"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Accept either the bare ID or a pasted sheet URL
+/// (`https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0`).
+pub fn normalize_spreadsheet_id(raw: &str) -> String {
+    let raw = raw.trim();
+    match raw.split_once("/spreadsheets/d/") {
+        Some((_, rest)) => rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+        None => raw.to_owned(),
+    }
+}
+
 /// Storefront origin assumed in development when `PUBLIC_SITE_URL` is unset (Vite dev server).
 const DEV_SITE_URL: &str = "http://localhost:5173";
 
@@ -219,14 +424,7 @@ const RAZORPAY_PRODUCTION_API: &str = "https://api.razorpay.com";
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let app_env = match var_or("APP_ENV", "production")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "production" | "prod" => AppEnv::Production,
-            "development" | "dev" | "local" => AppEnv::Development,
-            other => bail!("APP_ENV must be 'production' or 'development', got '{other}'"),
-        };
+        let app_env = app_env_from_env()?;
 
         let email_provider = match var_or("EMAIL_PROVIDER", "ses")
             .to_ascii_lowercase()
@@ -335,18 +533,20 @@ impl Config {
             customer_order_emails_enabled: parse_or("CUSTOMER_ORDER_EMAIL_ENABLED", "true")?,
 
             pricing: Pricing {
-                bulk_min_order_paise: parse_or::<i64>("BULK_MIN_ORDER_RUPEES", "10000")?
+                bulk_min_order_paise: parse_or::<i64>("BULK_MIN_ORDER_RUPEES", "5000")?
                     .checked_mul(100)
                     .context("BULK_MIN_ORDER_RUPEES is out of range")?,
-                standard_discount_percent: parse_or("STANDARD_DISCOUNT_PERCENT", "75")?,
+                standard_discount_percent: parse_or("STANDARD_DISCOUNT_PERCENT", "80")?,
                 bulk_discount_percent: parse_or("BULK_DISCOUNT_PERCENT", "85")?,
-                delivery_fee_paise: parse_or::<i64>("DELIVERY_FEE_RUPEES", "350")?
+                delivery_fee_paise: parse_or::<i64>("DELIVERY_FEE_RUPEES", "500")?
                     .checked_mul(100)
                     .context("DELIVERY_FEE_RUPEES is out of range")?,
                 free_delivery_min_paise: parse_or::<i64>("FREE_DELIVERY_MIN_RUPEES", "5000")?
                     .checked_mul(100)
                     .context("FREE_DELIVERY_MIN_RUPEES is out of range")?,
             },
+
+            google_sheets: GoogleSheetsConfig::from_env(app_env)?,
         };
 
         cfg.validate()?;
@@ -555,6 +755,18 @@ impl Config {
     }
 }
 
+/// `APP_ENV` (default `production`).
+pub fn app_env_from_env() -> anyhow::Result<AppEnv> {
+    match var_or("APP_ENV", "production")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "production" | "prod" => Ok(AppEnv::Production),
+        "development" | "dev" | "local" => Ok(AppEnv::Development),
+        other => bail!("APP_ENV must be 'production' or 'development', got '{other}'"),
+    }
+}
+
 fn required(key: &str) -> anyhow::Result<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Ok(v),
@@ -582,27 +794,44 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Pricing;
+    use super::{Pricing, normalize_spreadsheet_id};
+
+    #[test]
+    fn spreadsheet_id_from_url_or_bare() {
+        let id = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcd";
+        assert_eq!(normalize_spreadsheet_id(id), id);
+        assert_eq!(normalize_spreadsheet_id(&format!("  {id} ")), id);
+        assert_eq!(
+            normalize_spreadsheet_id(&format!(
+                "https://docs.google.com/spreadsheets/d/{id}/edit#gid=0"
+            )),
+            id
+        );
+        assert_eq!(
+            normalize_spreadsheet_id(&format!("https://docs.google.com/spreadsheets/d/{id}")),
+            id
+        );
+    }
 
     #[test]
     fn pricing_defaults_and_tier() {
         let p = Pricing::default();
         assert!(p.validate().is_ok());
-        assert_eq!(p.bulk_min_order_paise, 1_000_000);
-        assert!(p.is_bulk(1_000_000), "exactly ₹10,000 is bulk");
-        assert!(!p.is_bulk(999_999));
-        // 75 % off MRP ₹210 = ₹52.50 → ₹53.
-        assert_eq!(p.standard_discount_percent, 75);
-        assert_eq!(p.standard_price_paise(3_200, 21_000), 5_300);
+        assert_eq!(p.bulk_min_order_paise, 500_000);
+        assert!(p.is_bulk(500_000), "exactly ₹5,000 is bulk");
+        assert!(!p.is_bulk(499_999));
+        // 80 % off MRP ₹210 = ₹42.
+        assert_eq!(p.standard_discount_percent, 80);
+        assert_eq!(p.standard_price_paise(3_200, 21_000), 4_200);
     }
 
     #[test]
     fn delivery_fee_below_free_minimum_only() {
         let p = Pricing::default();
-        assert_eq!(p.delivery_fee_paise, 35_000);
+        assert_eq!(p.delivery_fee_paise, 50_000);
         assert_eq!(p.free_delivery_min_paise, 500_000);
-        assert_eq!(p.delivery_fee_for(100), 35_000);
-        assert_eq!(p.delivery_fee_for(499_999), 35_000);
+        assert_eq!(p.delivery_fee_for(100), 50_000);
+        assert_eq!(p.delivery_fee_for(499_999), 50_000);
         assert_eq!(p.delivery_fee_for(500_000), 0, "exactly ₹5,000 ships free");
         assert_eq!(p.delivery_fee_for(1_000_000), 0);
         let always_free = Pricing {

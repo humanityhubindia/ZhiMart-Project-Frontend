@@ -13,6 +13,7 @@ pub mod outbox;
 pub mod payments;
 pub mod products;
 pub mod sessions;
+pub mod sheet_sync;
 
 use ipnetwork::IpNetwork;
 

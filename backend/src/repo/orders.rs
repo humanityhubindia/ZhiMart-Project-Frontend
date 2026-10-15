@@ -511,6 +511,25 @@ pub async fn load_full(conn: &mut PgConnection, r: &OrderRef) -> sqlx::Result<Op
     with_items(&mut *conn, row).await.map(Some)
 }
 
+/// Load several orders with their items (2 queries). Missing ids are skipped;
+/// the result is in no particular order.
+pub async fn load_many(conn: &mut PgConnection, ids: &[Uuid]) -> sqlx::Result<Vec<Order>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, OrderRow>(concat!(
+        "SELECT ",
+        order_cols!(),
+        " FROM orders WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let found: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let items = items_for(&mut *conn, &found).await?;
+    Ok(assemble(rows, items))
+}
+
 /// Attach items to one already-loaded row.
 pub async fn with_items<'e>(conn: impl PgExecutor<'e>, row: OrderRow) -> sqlx::Result<Order> {
     let items = items_for(conn, &[row.id]).await?;

@@ -53,6 +53,8 @@ browser ──HTTPS──► CDN / WAF ──► load balancer / reverse proxy (
   stale edit returns 409 `version_conflict`.
 - **Background jobs**:
   - Every ~5 s: send queued admin "new order" emails from the outbox.
+  - Every ~5 s (only with `GOOGLE_SHEETS_ENABLED=true`): write new or changed orders
+    to the Google Sheet (see "Google Sheets order sync").
   - Every ~30 s: cancel unpaid orders past their payment window and release their stock.
   - Every ~10 minutes: delete expired challenges, tokens, sessions and old audit rows.
   - Every 60 s: remove idle entries from the rate limiters.
@@ -94,6 +96,8 @@ on POST requests, and the CSRF check validates it.
 | `zhimart-backend migrate` | Apply pending migrations and exit. |
 | `zhimart-backend create-admin --email E --name N` | Create an admin. |
 | `zhimart-backend reset-password --email E` | Set a new password, clear the lockout, revoke all of that admin's sessions. |
+| `zhimart-backend google-auth [--no-browser]` | One-time Google consent; prints `GOOGLE_OAUTH_REFRESH_TOKEN` (see "Google Sheets order sync"). |
+| `zhimart-backend google-sheets-check` | Verify the Google Sheets settings, create the tab and header row if missing. |
 
 `migrate`, `create-admin` and `reset-password` need only `DATABASE_URL`. On a terminal,
 the password is prompted twice and not echoed. Otherwise it is read as a single line
@@ -319,16 +323,16 @@ Bulk fake orders from many IPs are an edge/WAF problem. Watch the dashboard's
 Two price tiers, decided per order, server-side:
 
 - **Bulk.** The cart's total at **price-list prices** (`products.price`, about 85 % off
-  MRP) is at least `BULK_MIN_ORDER_RUPEES` (default ₹10,000; exactly ₹10,000 counts).
+  MRP) is at least `BULK_MIN_ORDER_RUPEES` (default ₹5,000; exactly ₹5,000 counts).
   Every line is charged its list price.
 - **Standard.** Below that minimum, **every** line is charged the standard price:
-  MRP × (100 − `STANDARD_DISCOUNT_PERCENT`) / 100 (default 75 % off), rounded **up** to
+  MRP × (100 − `STANDARD_DISCOUNT_PERCENT`) / 100 (default 80 % off), rounded **up** to
   a whole rupee, never below the list price and never above the MRP. Example: MRP ₹210,
-  list ₹32 → standard ₹53 (₹52.50 rounded up); MRP ₹200 → ₹50. A product discounted
-  less than 75 % (or without an MRP) costs its list price in both tiers.
+  list ₹32 → standard ₹42; MRP ₹212 → ₹43 (₹42.40 rounded up). A product discounted
+  less than 80 % (or without an MRP) costs its list price in both tiers.
 
-The tier is decided on list prices, so a ₹9,990 list-price cart pays standard prices
-(which may come to more than ₹10,000) and adding one more item can lower the bill. The
+The tier is decided on list prices, so a ₹4,990 list-price cart pays standard prices
+(which may come to more than ₹5,000) and adding one more item can lower the bill. The
 storefront shows both prices (`price`, `standardPrice`) and the rule (`pricing`), so it can
 tell the customer how far they are from bulk pricing.
 
@@ -345,7 +349,7 @@ placed at.
 
 After tier pricing, the goods total is the order's **subtotal**. An order whose subtotal
 is below `FREE_DELIVERY_MIN_RUPEES` (default ₹5,000) pays a flat `DELIVERY_FEE_RUPEES`
-(default ₹350); from ₹5,000 (inclusive) delivery is free. `FREE_DELIVERY_MIN_RUPEES=0`
+(default ₹500); from ₹5,000 (inclusive) delivery is free. `FREE_DELIVERY_MIN_RUPEES=0`
 makes delivery always free; `DELIVERY_FEE_RUPEES=0` does too.
 
 - The server decides the fee; the client never sends it. It is stored per order in
@@ -356,7 +360,7 @@ makes delivery always free; `DELIVERY_FEE_RUPEES=0` does too.
   delivery. Top-product revenue is line totals, so it excludes it.
 - Order JSON carries `subtotal`, `deliveryFee` and `totalAmount`; `GET /products` and
   `GET /storefront/config` publish `pricing.deliveryFee` and `pricing.freeDeliveryMin`.
-- Both order emails show Subtotal, Delivery ("₹350" or "FREE"), "Tax (GST): ₹0" (prices
+- Both order emails show Subtotal, Delivery ("₹500" or "FREE"), "Tax (GST): ₹0" (prices
   are tax-inclusive) and the total. Savings are computed on the goods only.
 - Under `PAYMENT_TEST_MODE` the delivery charge is ₹1 (like every unit), applied when the
   ₹1-per-unit subtotal is below the free-delivery minimum.
@@ -386,7 +390,7 @@ checkout.
     token sits in the URL fragment, so it never reaches servers, logs or `Referer`.
     The email warns: "keep this link private — anyone with it can see your order
     status".
-  - Items, MRP total, savings, subtotal, delivery ("₹350" or "FREE"), "Tax (GST): ₹0"
+  - Items, MRP total, savings, subtotal, delivery ("₹500" or "FREE"), "Tax (GST): ₹0"
     and total, then the delivery address.
   - Payment section:
     - Pay-later: "Our team will call you on +91 ••••• •1234…". The phone is masked to
@@ -424,7 +428,7 @@ checkout.
   - Subject `New order ZM-… — ₹X from <customer>`, prefixed `[TEST] ` for test orders.
   - Order number and time in IST.
   - Customer details: name, tap-to-call phone, email, address with pincode, notes.
-  - An item table with MRP, savings, subtotal, delivery ("₹350" or "FREE"),
+  - An item table with MRP, savings, subtotal, delivery ("₹500" or "FREE"),
     "Tax (GST): ₹0" and the amount payable.
   - Payment method and status, plus the Razorpay payment id when paid online.
   - An **Open admin console** button pointing at `PUBLIC_SITE_URL/?page=admin` (only
@@ -439,6 +443,168 @@ checkout.
   - Resend a failed row:
     `UPDATE email_outbox SET status = 'pending', attempts = 0, next_attempt_at = now() WHERE id = '…';`
   - Sent rows are purged after 90 days, failed rows after a year.
+
+## Google Sheets order sync
+
+Every order is mirrored into a Google Sheet (the client's **Crackers-Ordering-Leads**),
+one row per order. The row is appended when the order is placed. It is rewritten in place
+whenever the order changes: payment recorded or captured, refunds, status changes
+(dispatched, in transit, delivered, cancelled, including the unpaid-order expiry), and
+courier or LR details. Off by default (`GOOGLE_SHEETS_ENABLED=false`).
+
+**Columns** (tab `GOOGLE_SHEETS_TAB`, default `Orders`; created with a bold, frozen header
+row if missing):
+
+Order No · Placed At (IST) · Customer Name · Phone · WhatsApp (`https://wa.me/91…`) ·
+Email · Address · City · Pincode · State · Items (`Flower Pots Special × 2 @ ₹42; …`) ·
+Total Units · MRP Total · Subtotal · Delivery Charge · Total Payable · Pricing Tier ·
+Payment Status (Unpaid / Awaiting payment / Paid / Partially refunded / Refunded /
+Payment failed) · Amount Paid · Amount Refunded · Payment Method / Reference ·
+Order Status (with the reason when cancelled) · Courier · LR / Docket No ·
+Customer Notes · Test Order (Yes/No) · Last Updated (IST)
+
+- Money columns are plain numbers in rupees (`576`, `52.5`), so `SUM()` works.
+- Everything is written with `valueInputOption=RAW`. Customer text such as
+  `=HYPERLINK(…)` is stored as text and never runs as a formula.
+- With online payments on, orders appear as soon as checkout starts ("Awaiting
+  payment"). Abandoned checkouts later turn into "Cancelled (Payment not completed)".
+  Those are leads too.
+
+**How it works (and why checkout never waits for Google)**
+
+- Database triggers on `orders` put the order into `sheet_sync_queue` in the same
+  transaction as the change. This covers every code path: checkout, admin edits,
+  Razorpay verify and webhook, refunds, and the expiry sweep. Payment and refund state
+  lives on `orders`, so one trigger covers it. Checkout does one extra `INSERT` and no
+  network call.
+- A background worker (every replica, ~5 s, `SKIP LOCKED` plus a 120 s lease) takes up
+  to 100 queued orders. It reads column A (Order No) once and finds each order's row by
+  its order number, never by a stored row number, so sorting or inserting rows in the
+  sheet is safe. Rows it finds are updated in one `values:batchUpdate`. The rest are
+  appended in one `values:append` (`INSERT_ROWS`). A row someone deleted is simply
+  appended again. That is at most 3 Sheets requests per batch, far below Google's
+  60-per-minute quota.
+- A queued row is removed only if the order did not change while it was being synced
+  (compare-and-clear on a revision counter). Otherwise it is synced again right away.
+- Failures never drop anything:
+  - Network errors, 429 and 5xx back off for 30 s, doubling up to 30 min.
+  - An expired access token (401) is refreshed and the request retried once.
+  - Errors that need a human back off for 10 min, doubling up to 1 h, with an `ERROR`
+    log that names the fix: a revoked refresh token (`invalid_grant`), a rejected
+    client, or 403/404 (sheet not shared or wrong ID).
+- Logs never contain the client secret, the refresh token, access tokens or any cell
+  values. `last_error` holds a short reason with no personal data.
+- **No backfill**: orders that existed when migration
+  `20261014000012_google_sheets_sync.sql` ran have `sync_to_sheet = false` and are never
+  synced, even when edited later.
+- **While disabled**, orders are still queued (one small row per order; the database
+  cannot see the env). When you enable the sync later, every order placed since the
+  migration is synced. To skip those, run `DELETE FROM sheet_sync_queue;` before
+  enabling.
+
+### Setup, step by step
+
+You need a Google Cloud project with an OAuth client. Its ID and secret go in
+`GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`. If a secret has ever been
+pasted anywhere public, create a new one first: open the client in Credentials, add a
+secret, then delete the old one. Never commit either value.
+
+1. **Enable the Google Sheets API.** In [Google Cloud Console](https://console.cloud.google.com/),
+   select the project, open *APIs & Services → Library*, search for "Google Sheets API"
+   and click **Enable**.
+2. **Set up the OAuth consent screen and publish it.** Open *APIs & Services → OAuth
+   consent screen* (in newer consoles: *Google Auth Platform → Branding / Audience*).
+   - User type: **External**. Add an app name and your email.
+   - Scopes: you can leave this empty. `google-auth` asks for
+     `https://www.googleapis.com/auth/spreadsheets` itself.
+   - On *Audience*, click **Publish app** so the status reads **In production**.
+     **Important:** while the app is in "Testing", Google expires refresh tokens after
+     **7 days** and the sync stops with `invalid_grant`. The app does not need Google
+     verification to be published. The "Google hasn't verified this app" warning
+     during consent is expected and fine for the owner's own account: click
+     *Advanced → Go to … (unsafe)*.
+3. **Check the OAuth client** under *APIs & Services → Credentials → OAuth 2.0 Client IDs*.
+   - **Desktop app**: works as is (no redirect URI to configure).
+   - **Web application**: under *Authorized redirect URIs* add exactly
+     `http://127.0.0.1:53682/` (with the trailing slash), then save. If you change the
+     port with `GOOGLE_OAUTH_REDIRECT_PORT`, register that port instead. Without this,
+     Google shows "Error 400: redirect_uri_mismatch".
+4. **Get the refresh token.** The simplest way is on your Mac, from this directory:
+   ```bash
+   cd backend
+   # put GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in backend/.env (or export them)
+   cargo run -- google-auth
+   ```
+   - It opens the consent page in your browser. If the browser does not open, copy the
+     printed URL.
+   - Sign in with the Google account that can **edit** the spreadsheet and allow the
+     Sheets permission.
+   - It catches the redirect on `http://127.0.0.1:53682/` and prints
+     `GOOGLE_OAUTH_REFRESH_TOKEN=…`. Treat that value like a password.
+
+   **On the server instead:**
+   ```bash
+   docker compose -f deploy/docker-compose.host-nginx.yml run --rm api google-auth --no-browser
+   ```
+   The container's loopback port is not reachable from your laptop's browser, so after
+   you approve, the browser tab fails to load `http://127.0.0.1:53682/?state=…&code=…`.
+   Copy that whole address from the address bar, paste it into the server terminal and
+   press Enter. The command accepts a pasted redirect URL. Running it on the Mac is
+   simpler.
+5. **Copy the spreadsheet ID.** Open the sheet. Its URL looks like
+   `https://docs.google.com/spreadsheets/d/<THIS-LONG-ID>/edit#gid=0`. Copy
+   `<THIS-LONG-ID>`. Pasting the whole URL also works.
+6. **Set the env vars** in the server's `backend/.env`:
+   ```bash
+   GOOGLE_SHEETS_ENABLED=true
+   GOOGLE_OAUTH_CLIENT_ID=<id>.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=<secret>
+   GOOGLE_OAUTH_REFRESH_TOKEN=<from step 4>
+   GOOGLE_SHEETS_SPREADSHEET_ID=<from step 5>
+   GOOGLE_SHEETS_TAB=Orders
+   ```
+   With `GOOGLE_SHEETS_ENABLED=true`, the API refuses to start if any of these is
+   missing. Use a tab the sync owns. If the spreadsheet already has an `Orders` tab
+   holding other data, pick a new name such as `GOOGLE_SHEETS_TAB=Website Orders`. A
+   missing tab is created; an existing non-empty row 1 is never overwritten.
+7. **Redeploy, then verify.**
+   ```bash
+   docker compose -f deploy/docker-compose.host-nginx.yml run --rm api google-sheets-check
+   docker compose -f deploy/docker-compose.host-nginx.yml up -d --build
+   docker compose -f deploy/docker-compose.host-nginx.yml logs -f api | grep -i "google sheets"
+   ```
+   - `google-sheets-check` refreshes a token and prints `OK: connected to spreadsheet
+     "Crackers-Ordering-Leads"`. It also creates the `Orders` tab and header row if
+     they are missing.
+   - At startup the log shows `Google Sheets order sync enabled`.
+   - Place a test order. Within ~10 s the log shows `google sheets: orders synced
+     appended=1` and the row appears.
+
+### Re-authorising (refresh token expired or revoked)
+
+The log says `refresh token revoked or expired (invalid_grant)`. Queued rows wait; they
+are not lost. Common causes:
+- The consent screen was still in "Testing" (7-day expiry): publish it (step 2).
+- The account's password was changed, or access was removed at
+  <https://myaccount.google.com/permissions>.
+- The token went unused for 6 months.
+- The client secret was rotated. That needs a new refresh token too.
+
+To fix it, run step 4 again, replace `GOOGLE_OAUTH_REFRESH_TOKEN` in `backend/.env`, and
+restart the API (`docker compose … up -d`). The backlog syncs within the next backoff
+window, at most 1 h. To flush it immediately:
+`UPDATE sheet_sync_queue SET next_attempt_at = now();`
+
+**Ops queries**
+- Backlog: `SELECT count(*), min(requested_at), max(attempts) FROM sheet_sync_queue;`
+- Why it is stuck:
+  `SELECT o.order_number, q.attempts, q.next_attempt_at, q.last_error FROM sheet_sync_queue q JOIN orders o ON o.id = q.order_id ORDER BY q.requested_at LIMIT 20;`
+- Re-sync one order (for example after someone edited its row by hand):
+  `INSERT INTO sheet_sync_queue (order_id) SELECT id FROM orders WHERE order_number = 'ZM-…' ON CONFLICT (order_id) DO UPDATE SET revision = sheet_sync_queue.revision + 1, next_attempt_at = now();`
+
+Manual edits to a synced row are overwritten the next time that order changes. Keep your
+own notes in extra columns to the right of **Last Updated (IST)**; the sync writes only
+columns A–AA.
 
 ## Payments (Razorpay)
 

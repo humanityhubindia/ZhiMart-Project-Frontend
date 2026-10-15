@@ -159,8 +159,8 @@ struct ProductList {
 }
 
 /// The two-tier pricing rule and the delivery charge, for the storefront
-/// (`GET /products`, `GET /storefront/config`): `{ "bulkMinOrder": 10000,
-/// "bulkDiscountPercent": 85, "standardDiscountPercent": 75, "deliveryFee": 350,
+/// (`GET /products`, `GET /storefront/config`): `{ "bulkMinOrder": 5000,
+/// "bulkDiscountPercent": 85, "standardDiscountPercent": 80, "deliveryFee": 500,
 /// "freeDeliveryMin": 5000 }` (rupees / whole percents). Built from
 /// [`crate::config::Config::effective_pricing`], so in payment test mode
 /// `deliveryFee` is what test orders are charged (₹1).

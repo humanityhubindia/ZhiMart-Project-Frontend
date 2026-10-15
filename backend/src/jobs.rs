@@ -1,13 +1,18 @@
-//! Background jobs: admin order-notification outbox, unpaid-order expiry,
-//! database retention purge, and rate-limiter memory GC. All loops exit
+//! Background jobs: admin order-notification outbox, Google Sheets order sync,
+//! unpaid-order expiry, database retention purge, and rate-limiter memory GC. All loops exit
 //! promptly when the shutdown signal flips to `true`, and all are safe to run
 //! on every replica (`SKIP LOCKED` + leases in the repo functions).
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use rand::Rng;
 use sqlx::PgPool;
 use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
+use uuid::Uuid;
 
 use crate::{
     config::Config,
@@ -17,7 +22,9 @@ use crate::{
         self,
         orders::{Order, OrderRef},
         outbox::{KIND_ADMIN_ORDER_NOTIFICATION, KIND_CUSTOMER_ORDER_CONFIRMATION, OutboxItem},
+        sheet_sync::SheetSyncItem,
     },
+    sheets::{SheetsClient, SheetsError, row},
     state::AppState,
 };
 
@@ -31,6 +38,19 @@ const OUTBOX_MAX_BATCHES_PER_TICK: u32 = 10;
 /// Upper bound on one provider call. Well inside the 120 s claim lease, so a
 /// slow send never lets another worker claim the same row concurrently.
 const OUTBOX_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Google Sheets sync cadence: a new order reaches the sheet within ~10 s.
+/// One batch per tick costs at most 3 Sheets requests whatever its size (read
+/// column A, one batch update, one append), so even a backlog stays far below
+/// Google's per-user quota (60 reads + 60 writes per minute).
+const SHEETS_INTERVAL: Duration = Duration::from_secs(5);
+const SHEETS_JITTER: Duration = Duration::from_secs(2);
+const SHEETS_INITIAL_DELAY: Duration = Duration::from_secs(10);
+pub const SHEETS_BATCH: i64 = 100;
+/// Upper bound on one batch (token refresh + Sheets calls, 20 s each at most).
+/// Well inside the 120 s claim lease, so a slow batch never lets another
+/// worker claim the same orders concurrently (which could append twice).
+const SHEETS_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Maintenance cadence (plus up to [`MAINTENANCE_JITTER`] so replicas spread out).
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -76,12 +96,170 @@ pub fn spawn(
             db,
             Arc::clone(&state.config),
             Arc::clone(&state.email),
-            shutdown,
+            shutdown.clone(),
         )));
     } else {
         tracing::info!("order emails disabled (admin and customer): outbox worker not started");
     }
+    match &state.sheets {
+        Some(sheets) => handles.push(tokio::spawn(sheet_sync_loop(
+            state.db.clone(),
+            Arc::clone(sheets),
+            shutdown,
+        ))),
+        None => tracing::info!(
+            "GOOGLE_SHEETS_ENABLED=false: Google Sheets sync worker not started (orders stay queued in sheet_sync_queue)"
+        ),
+    }
     handles
+}
+
+// ---------------------------------------------------------------------------
+// Google Sheets order sync
+// ---------------------------------------------------------------------------
+
+/// What one [`process_sheet_sync_once`] call did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SheetSyncRun {
+    pub claimed: usize,
+    pub appended: usize,
+    pub updated: usize,
+    /// Rows left queued after a failed attempt (retried with backoff).
+    pub retried: usize,
+    /// Synced, but the order changed mid-sync: queued again for an immediate re-sync.
+    pub requeued: usize,
+}
+
+/// Delay before retrying a failed batch. Transient errors (network, 429, 5xx)
+/// back off 30 s × 2^(n-1) up to 30 min; errors that need a human (revoked
+/// token, no access, bad request) start at 10 min and cap at 1 h, so a broken
+/// setup costs a few requests and log lines per hour. Rows are never dropped.
+pub fn sheets_retry_backoff(attempts: i32, err: &SheetsError) -> Duration {
+    let n = u32::try_from((attempts - 1).clamp(0, 10)).unwrap_or(0);
+    let secs = if err.is_transient() {
+        (30u64 << n).min(30 * 60)
+    } else {
+        (600u64 << n).min(60 * 60)
+    };
+    Duration::from_secs(secs)
+}
+
+async fn sheet_sync_loop(
+    db: PgPool,
+    sheets: Arc<SheetsClient>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tracing::info!(
+        spreadsheet_id = sheets.spreadsheet_id(),
+        tab = sheets.tab(),
+        "Google Sheets order sync enabled"
+    );
+    let mut delay = SHEETS_INITIAL_DELAY + jitter(SHEETS_JITTER);
+    loop {
+        tokio::select! {
+            _ = shutdown_requested(&mut shutdown) => break,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        match process_sheet_sync_once(&db, &sheets).await {
+            Ok(run) => {
+                if run.appended + run.updated > 0 {
+                    tracing::info!(
+                        appended = run.appended,
+                        updated = run.updated,
+                        requeued = run.requeued,
+                        "google sheets: orders synced"
+                    );
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "google sheets: queue query failed"),
+        }
+        delay = SHEETS_INTERVAL + jitter(SHEETS_JITTER);
+    }
+    tracing::debug!("google sheets sync job stopped");
+}
+
+/// Claim one batch of dirty orders and write their current state to the
+/// sheet (update in place, or append when the order number is not in column
+/// A). On success each row is cleared only if the order did not change
+/// meanwhile; on failure every claimed row is pushed back with backoff.
+/// Delivery is at-least-once and idempotent: a repeat finds the row by
+/// order number and rewrites it.
+pub async fn process_sheet_sync_once(
+    db: &PgPool,
+    sheets: &SheetsClient,
+) -> sqlx::Result<SheetSyncRun> {
+    let mut run = SheetSyncRun::default();
+    let items = repo::sheet_sync::claim_due(db, SHEETS_BATCH).await?;
+    run.claimed = items.len();
+    if items.is_empty() {
+        return Ok(run);
+    }
+
+    let ids: Vec<Uuid> = items.iter().map(|i| i.order_id).collect();
+    let mut orders = {
+        // Released before any Google call.
+        let mut conn = db.acquire().await?;
+        repo::orders::load_many(&mut conn, &ids).await?
+    };
+    let found: HashSet<Uuid> = orders.iter().map(|o| o.id).collect();
+    let gone: Vec<Uuid> = ids
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect();
+    repo::sheet_sync::forget(db, &gone).await?;
+    let items: Vec<&SheetSyncItem> = items
+        .iter()
+        .filter(|i| found.contains(&i.order_id))
+        .collect();
+    if items.is_empty() {
+        return Ok(run);
+    }
+    // New rows land in the order the orders were placed.
+    orders.sort_by(|a, b| (a.created_at, &a.order_number).cmp(&(b.created_at, &b.order_number)));
+    let rows: Vec<_> = orders.iter().map(row::order_row).collect();
+
+    let result = match tokio::time::timeout(SHEETS_BATCH_TIMEOUT, sheets.upsert_rows(&rows)).await {
+        Ok(r) => r,
+        Err(_) => Err(SheetsError::Transient("sync batch timed out".into())),
+    };
+    match result {
+        Ok(outcome) => {
+            run.appended = outcome.appended;
+            run.updated = outcome.updated;
+            for item in items {
+                match repo::sheet_sync::complete(db, item).await {
+                    Ok(true) => {}
+                    Ok(false) => run.requeued += 1,
+                    // The lease expires and the order is re-synced (an in-place update).
+                    Err(e) => {
+                        tracing::error!(order_id = %item.order_id, error = %e, "google sheets: clearing queue row failed")
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            run.retried = items.len();
+            let attempt = items.iter().map(|i| i.attempts).max().unwrap_or(1);
+            if err.is_transient() {
+                tracing::warn!(orders = items.len(), attempt, error = %err, hint = err.hint(), "google sheets: sync failed; will retry");
+            } else {
+                tracing::error!(orders = items.len(), attempt, error = %err, hint = err.hint(), "google sheets: sync failed; will retry");
+            }
+            let mut by_backoff: HashMap<Duration, Vec<Uuid>> = HashMap::new();
+            for item in &items {
+                by_backoff
+                    .entry(sheets_retry_backoff(item.attempts, &err))
+                    .or_default()
+                    .push(item.order_id);
+            }
+            let summary = err.summary();
+            for (backoff, ids) in by_backoff {
+                repo::sheet_sync::mark_retry(db, &ids, backoff, &summary).await?;
+            }
+        }
+    }
+    Ok(run)
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +706,27 @@ async fn limiter_gc_loop(limiters: RateLimiters, mut shutdown: watch::Receiver<b
 
 #[cfg(test)]
 mod tests {
-    use super::redact_addresses;
+    use std::time::Duration;
+
+    use super::{redact_addresses, sheets_retry_backoff};
+    use crate::sheets::SheetsError;
+
+    #[test]
+    fn sheets_backoff_grows_and_caps() {
+        let t = SheetsError::Transient("x".into());
+        assert_eq!(sheets_retry_backoff(1, &t), Duration::from_secs(30));
+        assert_eq!(sheets_retry_backoff(2, &t), Duration::from_secs(60));
+        assert_eq!(sheets_retry_backoff(6, &t), Duration::from_secs(960));
+        assert_eq!(sheets_retry_backoff(7, &t), Duration::from_secs(1800));
+        assert_eq!(sheets_retry_backoff(500, &t), Duration::from_secs(1800));
+        assert_eq!(sheets_retry_backoff(0, &t), Duration::from_secs(30));
+        let p = SheetsError::AuthRevoked;
+        assert_eq!(sheets_retry_backoff(1, &p), Duration::from_secs(600));
+        assert_eq!(sheets_retry_backoff(2, &p), Duration::from_secs(1200));
+        assert_eq!(sheets_retry_backoff(3, &p), Duration::from_secs(2400));
+        assert_eq!(sheets_retry_backoff(4, &p), Duration::from_secs(3600));
+        assert_eq!(sheets_retry_backoff(40, &p), Duration::from_secs(3600));
+    }
 
     #[test]
     fn redacts_email_addresses_from_errors() {

@@ -173,7 +173,7 @@ export function TestBadge() {
   );
 }
 
-/** "85% bulk" / "75% standard" — the price tier an order was charged at. */
+/** "85% bulk" / "80% standard" — the price tier an order was charged at. */
 export function PricingTierBadge({ tier }: { tier: PricingTier }) {
   const rules = usePricingRules();
   const bulk = tier === 'bulk';

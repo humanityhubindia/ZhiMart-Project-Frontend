@@ -1,7 +1,9 @@
 //! Command-line interface and the operational subcommands.
 //!
 //! `migrate`, `create-admin` and `reset-password` only need `DATABASE_URL`, so
-//! operators can run them without JWT/OTP/SES secrets being present.
+//! operators can run them without JWT/OTP/SES secrets being present. The
+//! Google Sheets commands (`google-auth`, `google-sheets-check`, implemented in
+//! `sheets::setup`) need only the `GOOGLE_*` settings and no database.
 
 use std::{
     io::{BufRead, IsTerminal},
@@ -61,6 +63,18 @@ pub enum Command {
         #[arg(long)]
         email: String,
     },
+    /// One-time Google OAuth consent for the Sheets order sync: prints the
+    /// refresh token for GOOGLE_OAUTH_REFRESH_TOKEN. Needs only
+    /// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET; listens on
+    /// http://127.0.0.1:53682/ (GOOGLE_OAUTH_REDIRECT_PORT) for the redirect.
+    GoogleAuth {
+        /// Only print the consent URL; do not try to open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Verify the Google Sheets settings: refresh a token, create the tab and
+    /// header row if missing, and print the spreadsheet title.
+    GoogleSheetsCheck,
 }
 
 /// Parse `DATABASE_URL` into connect options (no statement timeout; the
@@ -279,6 +293,19 @@ mod tests {
         .expect("parse");
         assert!(matches!(cli.command, Some(Command::CreateAdmin { .. })));
         assert!(Cli::try_parse_from(["zhimart-backend", "reset-password"]).is_err());
+        let cli = Cli::try_parse_from(["zhimart-backend", "google-auth"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::GoogleAuth { no_browser: false })
+        ));
+        let cli =
+            Cli::try_parse_from(["zhimart-backend", "google-auth", "--no-browser"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::GoogleAuth { no_browser: true })
+        ));
+        let cli = Cli::try_parse_from(["zhimart-backend", "google-sheets-check"]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::GoogleSheetsCheck)));
     }
 
     #[test]

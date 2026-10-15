@@ -100,6 +100,7 @@ fn config(enabled: bool, explicit: &[&str]) -> Config {
         public_site_url: Some("https://zhimart.example".into()),
         customer_order_emails_enabled: false,
         pricing: Default::default(),
+        google_sheets: None,
     }
 }
 

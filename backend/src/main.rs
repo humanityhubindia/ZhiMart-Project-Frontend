@@ -1,5 +1,5 @@
 //! zhimart-backend binary: `serve` (default), `migrate`, `create-admin`,
-//! `reset-password`.
+//! `reset-password`, `google-auth`, `google-sheets-check`.
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
@@ -12,7 +12,7 @@ use zhimart_backend::{
     app,
     cli::{self, Cli, Command},
     config::Config,
-    email, jobs, routes,
+    email, jobs, routes, sheets,
     state::AppState,
     telemetry::{self, LogFormat},
 };
@@ -68,6 +68,8 @@ fn main() -> ExitCode {
             Command::Migrate => cli::migrate().await,
             Command::CreateAdmin { email, name } => cli::create_admin(&email, &name).await,
             Command::ResetPassword { email } => cli::reset_password(&email).await,
+            Command::GoogleAuth { no_browser } => sheets::setup::google_auth(!no_browser).await,
+            Command::GoogleSheetsCheck => sheets::setup::sheets_check().await,
         }
     });
     // Do not wait on stray blocking tasks (e.g. a hash in flight) at exit.

@@ -298,6 +298,11 @@ export function orderErrorMessage(err: unknown): string {
 export function whatsappLink(order: Order): string | null {
   const digits = order.customer.phone.replace(/\D/g, '');
   if (digits.length < 10) return null;
+  return `https://wa.me/${digits}?text=${encodeURIComponent(whatsappMessage(order))}`;
+}
+
+/** The order-update text sent over WhatsApp (with the chat link, or as the caption of the shared PDF). */
+export function whatsappMessage(order: Order): string {
   const s = order.shipping;
   const lines = [
     `*Zhi-Mart Fireworks — Order Update*`,
@@ -316,7 +321,7 @@ export function whatsappLink(order: Order): string | null {
     ``,
     `Thank you for shopping with Zhi-Mart Fireworks, Sivakasi.`
   );
-  return `https://wa.me/${digits}?text=${encodeURIComponent(lines.join('\n'))}`;
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------

@@ -331,6 +331,7 @@ fn test_config(api_base: String) -> Config {
         public_site_url: None,
         customer_order_emails_enabled: false,
         pricing: Default::default(),
+        google_sheets: None,
     }
 }
 
@@ -699,8 +700,8 @@ async fn storefront_config_is_public_and_cacheable(pool: PgPool) {
         r.body,
         json!({ "testMode": false, "onlinePaymentsEnabled": true, "razorpayKeyId": KEY_ID, "currency": "INR",
                 "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks",
-                "pricing": { "bulkMinOrder": 10000, "bulkDiscountPercent": 85, "standardDiscountPercent": 75,
-                             "deliveryFee": 350, "freeDeliveryMin": 5000 } })
+                "pricing": { "bulkMinOrder": 5000, "bulkDiscountPercent": 85, "standardDiscountPercent": 80,
+                             "deliveryFee": 500, "freeDeliveryMin": 5000 } })
     );
     assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=60");
 }
@@ -748,7 +749,7 @@ async fn pay_creates_razorpay_order_once_and_reuses_it(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn delivery_fee_is_part_of_the_payable_amount(pool: PgPool) {
-    const FEE: i64 = 35_000;
+    const FEE: i64 = 50_000;
     let h = setup(pool).await;
     let o = h.seed_order().await;
     sqlx::query(
@@ -770,8 +771,8 @@ async fn delivery_fee_is_part_of_the_payable_amount(pool: PgPool) {
         .await;
     assert_eq!(g.status, StatusCode::OK);
     assert_eq!(g.body["subtotal"], 1650);
-    assert_eq!(g.body["deliveryFee"], 350);
-    assert_eq!(g.body["totalAmount"], 2000);
+    assert_eq!(g.body["deliveryFee"], 500);
+    assert_eq!(g.body["totalAmount"], 2150);
 
     // Razorpay is asked for goods + delivery, and only that amount verifies.
     let p = h.pay(&o).await;
@@ -783,7 +784,7 @@ async fn delivery_fee_is_part_of_the_payable_amount(pool: PgPool) {
     let r = h.verify_signed(&o, &oid, "pay_Delivery001").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_eq!(r.body["payment"]["status"], "paid");
-    assert_eq!(r.body["totalAmount"], 2000);
+    assert_eq!(r.body["totalAmount"], 2150);
 
     // A full refund returns the delivery charge too.
     let v = h.row(o.id).await.version;
@@ -795,9 +796,9 @@ async fn delivery_fee_is_part_of_the_payable_amount(pool: PgPool) {
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(r.body["payment"]["amountRefunded"], 2000);
+    assert_eq!(r.body["payment"]["amountRefunded"], 2150);
     assert_eq!(r.body["subtotal"], 1650);
-    assert_eq!(r.body["deliveryFee"], 350);
+    assert_eq!(r.body["deliveryFee"], 500);
     assert_eq!(h.row(o.id).await.amount_refunded_paise, TOTAL + FEE);
 }
 
