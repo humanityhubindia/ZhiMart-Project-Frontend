@@ -256,7 +256,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               Free Delivery on ₹5,000+
             </h3>
             <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Free delivery on orders of ₹5,000 and above across Tamil Nadu, with insured transit and live docket tracking. Smaller orders ship for a flat ₹350.
+              Free delivery on orders of ₹5,000 and above across Tamil Nadu, with insured transit and live docket tracking. Smaller orders ship for a flat ₹500.
             </p>
           </div>
 

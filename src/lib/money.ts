@@ -21,7 +21,7 @@ export const formatRupees = (rupees: number) => formatter.format(Number(rupees) 
  * Two-tier pricing (served by `GET /products` as `pricing`, see backend/API.md):
  * when the cart adds up to at least `bulkMinOrder` at price-list (`price`) prices, every line is
  * charged at `price` (~85% off MRP); below that, every line is charged at `standardPrice`
- * (~75% off). The server applies the same rule when the order is placed.
+ * (~80% off). The server applies the same rule when the order is placed.
  *
  * Delivery: orders whose payable goods value (`subtotal`, after tier pricing) is below
  * `freeDeliveryMin` pay a flat `deliveryFee`; at or above it delivery is free. No tax (₹0 GST).
@@ -39,10 +39,10 @@ export interface PricingRules {
 }
 
 export const DEFAULT_PRICING: PricingRules = {
-  bulkMinOrder: 10000,
+  bulkMinOrder: 5000,
   bulkDiscountPercent: 85,
-  standardDiscountPercent: 75,
-  deliveryFee: 350,
+  standardDiscountPercent: 80,
+  deliveryFee: 500,
   freeDeliveryMin: 5000,
 };
 
@@ -52,6 +52,10 @@ export const hasDeliveryCharge = (rules: PricingRules) => rules.freeDeliveryMin 
 /** Delivery charge for a goods subtotal (rupees): 0 when empty or at/above `freeDeliveryMin`. */
 export const deliveryFeeFor = (subtotal: number, rules: PricingRules) =>
   subtotal > 0 && hasDeliveryCharge(rules) && subtotal < rules.freeDeliveryMin ? rules.deliveryFee : 0;
+
+/** The flat fee a non-empty cart is spared once it reaches `freeDeliveryMin` (0 while it still pays it). */
+export const waivedDeliveryFee = (totals: Pick<CartTotals, 'subtotal' | 'deliveryFee' | 'rules'>) =>
+  totals.subtotal > 0 && totals.deliveryFee === 0 && hasDeliveryCharge(totals.rules) ? totals.rules.deliveryFee : 0;
 
 /** False when there is no minimum (`bulkMinOrder` 0): every order gets the bulk price, nothing to unlock. */
 export const hasBulkThreshold = (rules: PricingRules) => rules.bulkMinOrder > 0;

@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils';
 /**
  * Skeleton matching ProductCard's layout box-for-box (same paddings, line boxes and wrapping), so
  * the grid doesn't shift when products arrive. The price block uses invisible "ghost" text with the
- * card's font sizes for the tier label, the Add-to-Cart button and the "Below ₹10,000 order" box,
+ * card's font sizes for the tier label, the Add-to-Cart button and the "Below ₹5,000 order" box,
  * so those wrap at exactly the same widths as the real card (button under the price on narrow
  * columns, two-line box on tablet columns). Keep in sync with ProductCard.tsx.
  */
@@ -41,7 +41,7 @@ export const ProductCardSkeleton: React.FC = () => (
         </div>
       </div>
 
-      {/* Price block: big price + tier label, Add-to-Cart button, "Below ₹10,000 order" box */}
+      {/* Price block: big price + tier label, Add-to-Cart button, "Below ₹5,000 order" box */}
       <div className="pt-4 border-t border-slate-100 space-y-2.5">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div className="min-w-0">
@@ -49,7 +49,7 @@ export const ProductCardSkeleton: React.FC = () => (
               <div className="h-6 w-24 bg-slate-200 rounded-md" />
             </div>
             <span className="block mt-0.5 text-[11px] font-bold leading-tight text-transparent bg-slate-100 rounded">
-              85% OFF · orders ₹10,000+
+              85% OFF · orders ₹5,000+
             </span>
           </div>
           <div className="shrink-0 inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-amber-100 text-xs font-bold text-transparent">
@@ -58,8 +58,8 @@ export const ProductCardSkeleton: React.FC = () => (
           </div>
         </div>
         <p className="text-[11px] leading-snug text-transparent bg-slate-50 border border-slate-200/80 rounded-lg px-2.5 py-1.5">
-          Below ₹10,000 order: <span className="font-extrabold">₹100</span>{' '}
-          <span className="whitespace-nowrap">(75% OFF)</span>
+          Below ₹5,000 order: <span className="font-extrabold">₹100</span>{' '}
+          <span className="whitespace-nowrap">(80% OFF)</span>
         </p>
       </div>
     </div>

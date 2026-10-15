@@ -1,5 +1,5 @@
-import React, { useEffect } from 'react';
-import { MessageCircle, Printer, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Loader2, MessageCircle, Printer, X } from 'lucide-react';
 import type { Order } from '../../types/admin';
 import { usePricingRules } from '../../hooks/useProducts';
 import { pricingTierLabel } from '../../lib/pricingTier';
@@ -13,11 +13,32 @@ import {
   PAYMENT_STATUS_META,
   paymentMethodSummary,
   whatsappLink,
+  whatsappMessage,
 } from './format';
+import { canShareFile, downloadFile, slipPdfFile } from './slipPdf';
 
 /** Printable order estimation slip (uses the `#printable-estimation-slip` print stylesheet). */
 export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onClose: () => void }) {
   const pricingRules = usePricingRules();
+  const slipRef = useRef<HTMLDivElement>(null);
+  // The slip PDF is built as soon as the modal opens, so the share sheet can open straight from
+  // the click (browsers only allow `navigator.share` shortly after a user gesture).
+  const pdfRef = useRef<Promise<File> | null>(null);
+  const [sharing, setSharing] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
+  useEffect(() => {
+    pdfRef.current = null;
+    setShareError(null);
+    if (!order) return;
+    const t = setTimeout(() => {
+      if (!slipRef.current) return;
+      const p = slipPdfFile(slipRef.current, `Zhi-Mart-${order.orderNumber}.pdf`);
+      p.catch(() => {}); // surfaced when the admin clicks share
+      pdfRef.current = p;
+    }, 400); // after fonts/images settle
+    return () => clearTimeout(t);
+  }, [order]);
+
   useEffect(() => {
     if (!order) return;
     const onKey = (e: KeyboardEvent) => {
@@ -33,6 +54,38 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
 
   if (!order) return null;
   const wa = whatsappLink(order);
+
+  /** Share the slip PDF + update text via the share sheet (pick WhatsApp → the customer's chat);
+   *  where files can't be shared (most desktop browsers) download the PDF and open the chat to attach it. */
+  const shareOnWhatsApp = async () => {
+    if (sharing) return;
+    setSharing(true);
+    setShareError(null);
+    try {
+      if (!pdfRef.current && slipRef.current) {
+        pdfRef.current = slipPdfFile(slipRef.current, `Zhi-Mart-${order.orderNumber}.pdf`);
+      }
+      const file = await pdfRef.current!;
+      const text = whatsappMessage(order);
+      if (canShareFile(file)) {
+        try {
+          await navigator.share({ files: [file], text, title: `Order ${order.orderNumber}` });
+          return;
+        } catch (e) {
+          if (e instanceof DOMException && e.name === 'AbortError') return; // admin closed the sheet
+          // NotAllowedError etc. → fall through to download + chat
+        }
+      }
+      downloadFile(file);
+      if (wa) window.open(wa, '_blank', 'noopener,noreferrer');
+    } catch {
+      pdfRef.current = null;
+      setShareError('Could not create the PDF — use Print / Save PDF instead.');
+      if (wa) window.open(wa, '_blank', 'noopener,noreferrer');
+    } finally {
+      setSharing(false);
+    }
+  };
   const { subtotal, deliveryFee } = orderCharges(order);
   // Discount is on goods (subtotal) only — the delivery charge is not part of it.
   const discount = Math.max(0, Math.round((order.mrpTotal - subtotal) * 100) / 100);
@@ -70,17 +123,16 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
               <Printer className="w-4 h-4" />
               <span>Print / Save PDF</span>
             </button>
-            {wa && (
-              <a
-                href={wa}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-3.5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition-all flex items-center gap-1.5"
-              >
-                <MessageCircle className="w-4 h-4" />
-                <span className="hidden sm:inline">WhatsApp update</span>
-              </a>
-            )}
+            <button
+              type="button"
+              onClick={shareOnWhatsApp}
+              disabled={sharing}
+              title="Share the slip PDF with the order update on WhatsApp"
+              className="px-3.5 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-70 text-white font-bold text-xs rounded-xl transition-all flex items-center gap-1.5"
+            >
+              {sharing ? <Loader2 className="w-4 h-4 animate-spin" /> : <MessageCircle className="w-4 h-4" />}
+              <span className="hidden sm:inline">{sharing ? 'Preparing PDF…' : 'WhatsApp update + PDF'}</span>
+            </button>
             <button
               type="button"
               onClick={onClose}
@@ -95,6 +147,7 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
         <div className="overflow-y-auto p-4 sm:p-8 bg-slate-200/60 flex-1">
           <div
             id="printable-estimation-slip"
+            ref={slipRef}
             className="bg-white rounded-2xl border border-slate-300 p-6 sm:p-10 shadow-lg text-slate-900 mx-auto max-w-3xl font-sans"
           >
             {/* Header */}
@@ -294,7 +347,12 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
 
         <div className="no-print bg-white px-6 py-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
           <span className="text-xs text-slate-500 font-semibold">
-            Tip: choose <em>Save as PDF</em> as the printer to download a copy.
+            {shareError ?? (
+              <>
+                WhatsApp: on phones pick WhatsApp → the customer&rsquo;s chat; on a computer the PDF downloads and
+                the chat opens — attach it there.
+              </>
+            )}
           </span>
           <button
             type="button"

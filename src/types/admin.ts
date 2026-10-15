@@ -71,7 +71,7 @@ export interface AdminProduct {
   price: number;
   originalPrice: number;
   discountPercent: number;
-  /** Price charged below the bulk threshold (≈75% off MRP; never below `price`). Derived by the server. */
+  /** Price charged below the bulk threshold (≈80% off MRP; never below `price`). Derived by the server. */
   standardPrice?: number;
   standardDiscountPercent?: number;
   image: string;

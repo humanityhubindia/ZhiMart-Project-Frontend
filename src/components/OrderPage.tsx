@@ -26,7 +26,7 @@ import { cn } from '@/lib/utils';
 import { isApiError } from '../lib/api';
 import { fetchGuestOrder, GuestOrder, PricingTier } from '../lib/ordersApi';
 import { buildOrderShareMessage, maskEmail, openWhatsApp } from '../lib/checkout';
-import { formatRupees, NO_TAX_NOTE, sumRupees } from '../lib/money';
+import { formatRupees, hasDeliveryCharge, NO_TAX_NOTE, sumRupees } from '../lib/money';
 import { useOrderPayment } from '../hooks/useOrderPayment';
 import { STOREFRONT_CONFIG_QUERY_KEY, useOnlinePaymentsEnabled, usePricingRules } from '../hooks/useProducts';
 import { CatalogErrorCard, errorMessage } from './CatalogStates';
@@ -631,7 +631,12 @@ export const OrderPage: React.FC<OrderPageProps> = ({
                 bulkMinOrder={pricing.bulkMinOrder}
               />
             )}
-            <BillingLines subtotal={order.subtotal} deliveryFee={order.deliveryFee} className="pt-1" />
+            <BillingLines
+              subtotal={order.subtotal}
+              deliveryFee={order.deliveryFee}
+              waivedFee={!order.isTest && order.deliveryFee === 0 && hasDeliveryCharge(pricing) ? pricing.deliveryFee : 0}
+              className="pt-1"
+            />
             <div className="flex items-center justify-between text-sm font-black text-slate-900 pt-2 border-t border-slate-100">
               <span>
                 {isPaid ? 'Amount paid' : isPayLater ? 'Amount payable' : 'Order total'}

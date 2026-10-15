@@ -25,7 +25,7 @@ import {
   EMPTY_CHECKOUT_FORM,
   validateCheckout,
 } from '../lib/checkout';
-import { computeTotals, formatRupees, hasBulkThreshold, lineTotal, NO_TAX_NOTE, unitPriceFor } from '../lib/money';
+import { computeTotals, formatRupees, hasBulkThreshold, lineTotal, NO_TAX_NOTE, unitPriceFor, waivedDeliveryFee } from '../lib/money';
 import { StockShortage } from '../lib/api';
 import { BillingLines, CartLineNotice, CheckoutFailureNotice, CheckoutFields, FreeDeliveryHint } from './CheckoutParts';
 import { BulkDiscountProgress } from './BulkDiscountProgress';
@@ -429,6 +429,7 @@ export const CartPage: React.FC<CartPageProps> = ({
                   <BillingLines
                     subtotal={subtotal}
                     deliveryFee={deliveryFee}
+                    waivedFee={waivedDeliveryFee(totals)}
                     className="border-t border-slate-100 pt-2"
                   />
 

@@ -11,7 +11,7 @@ import {
   EMPTY_CHECKOUT_FORM,
   validateCheckout,
 } from '../lib/checkout';
-import { computeTotals, formatRupees, lineTotal, NO_TAX_NOTE, unitPriceFor } from '../lib/money';
+import { computeTotals, formatRupees, lineTotal, NO_TAX_NOTE, unitPriceFor, waivedDeliveryFee } from '../lib/money';
 import { StockShortage } from '../lib/api';
 import { BillingLines, CartLineNotice, CheckoutFailureNotice, CheckoutFields, FreeDeliveryHint } from './CheckoutParts';
 import { BulkDiscountProgress } from './BulkDiscountProgress';
@@ -280,7 +280,12 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
                   </div>
                 </>
               ) : null}
-              <BillingLines subtotal={subtotal} deliveryFee={deliveryFee} className="pt-1 border-t border-neutral-100" />
+              <BillingLines
+                subtotal={subtotal}
+                deliveryFee={deliveryFee}
+                waivedFee={waivedDeliveryFee(totals)}
+                className="pt-1 border-t border-neutral-100"
+              />
               <FreeDeliveryHint totals={totals} className="mt-1" />
               <div className="flex items-center justify-between text-sm font-black text-slate-900 pt-1 border-t border-neutral-100">
                 <span>

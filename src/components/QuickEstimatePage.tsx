@@ -45,7 +45,7 @@ export const categoryLabel = (category: string) =>
     .toLowerCase()
     .replace(/\b\w/g, (c) => c.toUpperCase());
 
-/** "85% OFF on orders ₹10,000+ • 75% OFF below" */
+/** "85% OFF on orders ₹5,000+ • 80% OFF below" */
 export const tierSubtitle = (rules: PricingRules) =>
   hasBulkThreshold(rules)
     ? `${rules.bulkDiscountPercent}% OFF on orders ₹${formatRupees(rules.bulkMinOrder)}+ • ${rules.standardDiscountPercent}% OFF below`
@@ -71,7 +71,7 @@ export const TierRate: React.FC<{ product: CrackerProduct; bulkUnlocked: boolean
   );
 };
 
-/** "+ ₹350 delivery (FREE on orders ₹5,000+)" / "FREE delivery" for an estimate's goods value. */
+/** "+ ₹500 delivery (FREE on orders ₹5,000+)" / "FREE delivery" for an estimate's goods value. */
 export const deliveryNote = (totals: CartTotals): string | null => {
   const { rules } = totals;
   if (totals.subtotal <= 0 || !hasDeliveryCharge(rules)) return null;

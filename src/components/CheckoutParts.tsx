@@ -304,23 +304,36 @@ export const CartLineNotice: React.FC<{ item: CartItem; className?: string }> = 
 // Billing lines (subtotal / delivery / tax)
 // ---------------------------------------------------------------------------
 
-/** "₹350", or a green "FREE" when no delivery charge applies. */
-export const DeliveryChargeValue: React.FC<{ fee: number; className?: string }> = ({ fee, className }) =>
+/** "₹500", or a green "FREE" (with the waived fee struck through when given) when no charge applies. */
+export const DeliveryChargeValue: React.FC<{ fee: number; waivedFee?: number; className?: string }> = ({
+  fee,
+  waivedFee = 0,
+  className,
+}) =>
   fee > 0 ? (
     <span className={cn('font-semibold text-slate-800 tabular-nums', className)}>₹{formatRupees(fee)}</span>
   ) : (
-    <span className={cn('font-extrabold text-emerald-600', className)}>FREE</span>
+    <span className={cn('flex items-center gap-1.5', className)}>
+      {waivedFee > 0 && (
+        <span className="text-slate-400 line-through tabular-nums" aria-label={`was ₹${formatRupees(waivedFee)}`}>
+          ₹{formatRupees(waivedFee)}
+        </span>
+      )}
+      <span className="font-extrabold text-emerald-600">{waivedFee > 0 ? 'FREE delivery' : 'FREE'}</span>
+    </span>
   );
 
 /**
  * The Subtotal → Delivery charge → Tax (GST) lines shown above the payable total on the cart,
  * drawer and order page. Subtotal is the goods value after tier pricing.
  */
-export const BillingLines: React.FC<{ subtotal: number; deliveryFee: number; className?: string }> = ({
-  subtotal,
-  deliveryFee,
-  className,
-}) => (
+export const BillingLines: React.FC<{
+  subtotal: number;
+  deliveryFee: number;
+  /** Delivery fee the order would have paid; struck through next to "FREE delivery" when waived. */
+  waivedFee?: number;
+  className?: string;
+}> = ({ subtotal, deliveryFee, waivedFee, className }) => (
   <div className={cn('space-y-1.5 text-xs', className)}>
     <div className="flex items-center justify-between text-slate-700 font-semibold">
       <span>Subtotal</span>
@@ -328,7 +341,7 @@ export const BillingLines: React.FC<{ subtotal: number; deliveryFee: number; cla
     </div>
     <div className="flex items-center justify-between text-slate-600 font-medium">
       <span>Delivery charge</span>
-      <DeliveryChargeValue fee={deliveryFee} />
+      <DeliveryChargeValue fee={deliveryFee} waivedFee={waivedFee} />
     </div>
     <div className="flex items-center justify-between text-slate-600 font-medium">
       <span>Tax (GST)</span>

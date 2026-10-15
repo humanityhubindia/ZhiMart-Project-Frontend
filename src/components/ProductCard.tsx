@@ -17,10 +17,10 @@ import { formatRupees, PricingRules } from '../lib/money';
 export const hasTierPricing = (product: CrackerProduct, testMode: boolean) =>
   !testMode && product.standardPrice > product.price;
 
-/** "₹10,000" */
+/** "₹5,000" */
 export const bulkThresholdLabel = (rules: PricingRules) => `₹${formatRupees(rules.bulkMinOrder)}`;
 
-/** "85% OFF · orders ₹10,000+" */
+/** "85% OFF · orders ₹5,000+" */
 export const bulkPriceLabel = (product: CrackerProduct, rules: PricingRules) =>
   `${product.discountPercent}% OFF · orders ${bulkThresholdLabel(rules)}+`;
 
