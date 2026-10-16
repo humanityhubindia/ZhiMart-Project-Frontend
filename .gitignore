@@ -38,6 +38,7 @@ backend/target
 # Large Assets / Unneeded root files
 crackerspic/
 *.docx
+!frontend/public/*.docx
 *.sql
 # ...but never the database migrations: they hold the schema, catalog and image mapping.
 !backend/migrations/*.sql
