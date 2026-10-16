@@ -1,12 +1,10 @@
 import React from 'react';
 import {
   Truck,
-  MapPin,
   ShieldCheck,
   ArrowDown,
   FileSpreadsheet,
   Bot,
-  Percent,
   CheckCircle2,
 } from 'lucide-react';
 import { HeroCrackers } from '../lib/crackerPop';
@@ -157,61 +155,6 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                 </div>
               </div>
             </div>
-          </div>
-        </div>
-
-        {/* 4 Value Pillars: Consistent, Unified Slate & Amber Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-slate-200/70">
-          {/* Card 1 */}
-          <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-2xs hover:shadow-xs hover:border-slate-300 transition-all space-y-2.5">
-            <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex items-center justify-center font-bold">
-              <MapPin className="w-5 h-5 text-amber-600" />
-            </div>
-            <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              Direct From Sivakasi
-            </h3>
-            <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Every order is packed and dispatched directly from our Sivakasi manufacturing hub. Zero middleman fees.
-            </p>
-          </div>
-
-          {/* Card 2 */}
-          <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-2xs hover:shadow-xs hover:border-slate-300 transition-all space-y-2.5">
-            <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex items-center justify-center font-bold">
-              <Truck className="w-5 h-5 text-emerald-600" />
-            </div>
-            <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              Free Delivery on ₹5,000+
-            </h3>
-            <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Free delivery on orders of ₹5,000 and above across Tamil Nadu, with insured transit and live docket tracking. Smaller orders ship for a flat ₹500.
-            </p>
-          </div>
-
-          {/* Card 3 */}
-          <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-2xs hover:shadow-xs hover:border-slate-300 transition-all space-y-2.5">
-            <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex items-center justify-center font-bold">
-              <Percent className="w-5 h-5 text-blue-600" />
-            </div>
-            <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              Up to 85% Diwali Discount
-            </h3>
-            <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Wholesale factory rate cards applied automatically. Save up to 85% compared to local retail fireworks stalls.
-            </p>
-          </div>
-
-          {/* Card 4 */}
-          <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-2xs hover:shadow-xs hover:border-slate-300 transition-all space-y-2.5">
-            <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex items-center justify-center font-bold">
-              <ShieldCheck className="w-5 h-5 text-indigo-600" />
-            </div>
-            <h3 className="text-sm font-black text-slate-900 tracking-tight">
-              100% PESO Certified
-            </h3>
-            <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Government authorized green crackers featuring tested Visco delay fuses and decibel compliant acoustics.
-            </p>
           </div>
         </div>
       </div>
