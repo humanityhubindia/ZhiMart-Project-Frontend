@@ -30,7 +30,8 @@ export const ORDER_PIPELINE: readonly OrderStatus[] = [
 export const PAYMENT_STATUSES = ['pending', 'paid', 'refunded', 'failed'] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
-export const PAYMENT_METHODS = ['razorpay', 'pay_later', 'upi', 'card', 'netbanking', 'cod', 'bank_transfer'] as const;
+/** `razorpay` only on historical orders (before the move to Cashfree). */
+export const PAYMENT_METHODS = ['cashfree', 'razorpay', 'pay_later', 'upi', 'card', 'netbanking', 'cod', 'bank_transfer'] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
 /** Methods an admin may record with `mark_paid` (legacy manual collection). */
@@ -204,10 +205,12 @@ export interface OrderPayment {
   reference: string | null;
   paidAt: string | null;
   refundedAt: string | null;
-  /** Instrument reported by Razorpay: upi | card | netbanking | wallet | emi | paylater | bank_transfer. */
+  /** Instrument reported by the gateway: upi | card | netbanking | wallet | emi | paylater | bank_transfer. */
   instrument: string | null;
-  razorpayOrderId: string | null;
-  razorpayPaymentId: string | null;
+  /** Our order id at the gateway (Cashfree `order_id`; a Razorpay `order_…` id on legacy orders). */
+  gatewayOrderId: string | null;
+  /** Gateway payment id (Cashfree `cf_payment_id`; a Razorpay `pay_…` id on legacy orders). */
+  gatewayPaymentId: string | null;
   /** Rupees refunded so far (partial refunds accumulate). */
   amountRefunded: number;
   /** Set when a payment needs human attention (e.g. a late payment whose auto-refund failed). */
@@ -301,7 +304,10 @@ export interface PaymentEvent {
 
 export interface OrderRefund {
   id: string;
-  razorpayRefundId: string | null;
+  /** Gateway refund id (Cashfree `cf_refund_id`), once the gateway has accepted the refund. */
+  gatewayRefundId: string | null;
+  /** Gateway payment the refund applies to (absent on older servers). */
+  gatewayPaymentId?: string | null;
   amount: number;
   status: RefundStatus | (string & {});
   reason: string;
@@ -369,9 +375,12 @@ export interface SyncResponse {
 
 export interface StorefrontConfig {
   testMode: boolean;
-  /** `RAZORPAY_ENABLED`; false ⇒ orders are pay-later and payments are recorded manually. */
+  /** `CASHFREE_ENABLED`; false ⇒ orders are pay-later and payments are recorded manually. */
   onlinePaymentsEnabled: boolean;
-  razorpayKeyId: string | null;
+  /** `cashfree` when online payments are on, null otherwise. */
+  paymentGateway: 'cashfree' | null;
+  /** `CASHFREE_ENV` — `sandbox` (no real money) or `production`; null when payments are off. */
+  cashfreeMode: 'sandbox' | 'production' | null;
   currency: string;
   paymentExpiryMinutes: number;
   storeName: string;

@@ -77,6 +77,8 @@ export type ApiErrorCode =
   | 'order_expired'
   | 'order_not_payable'
   | 'payment_verification_failed'
+  | 'payment_pending'
+  | 'payment_not_completed'
   | 'payment_gateway_error'
   | 'online_payments_disabled'
   | 'network_error'

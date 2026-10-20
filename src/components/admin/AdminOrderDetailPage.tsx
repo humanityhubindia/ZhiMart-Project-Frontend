@@ -85,7 +85,7 @@ function buildTimeline(o: Order): TimelineEvent[] {
     ev.push({
       at: o.payment.paidAt,
       label: 'Payment received',
-      detail: [paymentMethodSummary(o.payment), o.payment.razorpayPaymentId ?? o.payment.reference].filter(Boolean).join(' · '),
+      detail: [paymentMethodSummary(o.payment), o.payment.gatewayPaymentId ?? o.payment.reference].filter(Boolean).join(' · '),
       tone: 'done',
     });
   if (o.shipping.dispatchedAt)
@@ -318,7 +318,7 @@ export function AdminOrderDetailPage({ target, onBack }: Props) {
           <div>
             <p className="font-black text-sm">Payment needs attention</p>
             <p className="mt-0.5">{order.payment.attention}</p>
-            <p className="mt-1 text-rose-700">Check Payment history and the Razorpay dashboard, then refund or contact customer.</p>
+            <p className="mt-1 text-rose-700">Check Payment history and the Cashfree Merchant Dashboard, then refund or contact customer.</p>
           </div>
         </div>
       )}

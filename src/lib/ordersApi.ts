@@ -6,7 +6,7 @@
  * - Re-sending the same `idempotencyKey` returns the original order (HTTP 200) instead of
  *   creating a second one; the same key with a different payload → 409 `idempotency_conflict`.
  */
-import { apiRequest } from './api';
+import { ApiError, apiRequest } from './api';
 import { orderCharges } from './money';
 
 export interface OrderCustomerInput {
@@ -97,7 +97,10 @@ export interface GuestOrder {
   createdAt: string;
   paymentExpiresAt: string | null;
   payment: {
-    /** `pay_later` when online payments are switched off, `razorpay` otherwise (may be absent). */
+    /**
+     * `cashfree` for online orders, `pay_later` when online payments are switched off, a manual
+     * method set by the team, or `razorpay` on legacy orders (may be absent).
+     */
     method?: string | null;
     status: 'pending' | 'paid' | 'refunded' | 'failed' | (string & {});
     instrument: string | null;
@@ -124,24 +127,19 @@ export interface GuestOrder {
   city: string;
 }
 
-/** `POST /orders/{orderNumber}/pay` → options for Razorpay Checkout. */
+/** `POST /orders/{orderNumber}/pay` → what Cashfree Checkout needs to open. */
 export interface PaymentSession {
-  keyId: string;
-  razorpayOrderId: string;
+  gateway: 'cashfree';
+  /** Opaque, short-lived Cashfree checkout session — passed straight to `checkout()`. */
+  paymentSessionId: string;
+  /** Our Cashfree `order_id` (`{orderNumber}_{suffix}`), for support/debugging only. */
+  gatewayOrderId: string;
   amountPaise: number;
   currency: string;
-  name: string;
-  description: string;
-  prefill: { name?: string; email?: string | null; contact?: string };
-  notes: Record<string, string>;
+  /** SDK mode; must match the environment the session was created in. */
+  mode: 'sandbox' | 'production';
   paymentExpiresAt: string | null;
   testMode: boolean;
-}
-
-export interface VerifyPaymentInput {
-  razorpayOrderId: string;
-  razorpayPaymentId: string;
-  razorpaySignature: string;
 }
 
 /** Server limits for a single order (mirrors backend validation). */
@@ -214,24 +212,43 @@ export async function fetchGuestOrder(
   return normalizeGuestOrder(res);
 }
 
-/** Creates (first call) or reuses the Razorpay order for this order. */
-export function startOrderPayment(orderNumber: string, orderToken: string): Promise<PaymentSession> {
-  return apiRequest<PaymentSession>(`${orderPath(orderNumber)}/pay`, {
+/**
+ * Creates (first call) or reuses the Cashfree order for this order and returns a checkout session.
+ * A response without a session id is treated as a gateway error rather than opening a broken modal.
+ */
+export async function startOrderPayment(orderNumber: string, orderToken: string): Promise<PaymentSession> {
+  const res = await apiRequest<Partial<PaymentSession>>(`${orderPath(orderNumber)}/pay`, {
     method: 'POST',
     headers: tokenHeader(orderToken),
   });
+  const paymentSessionId = typeof res?.paymentSessionId === 'string' ? res.paymentSessionId.trim() : '';
+  if (!paymentSessionId) {
+    throw new ApiError(502, 'payment_gateway_error', 'The payment service returned an incomplete response.');
+  }
+  return {
+    gateway: 'cashfree',
+    paymentSessionId,
+    gatewayOrderId: res?.gatewayOrderId ?? '',
+    amountPaise: Number(res?.amountPaise) || 0,
+    currency: res?.currency ?? 'INR',
+    mode: res?.mode === 'production' ? 'production' : 'sandbox',
+    paymentExpiresAt: res?.paymentExpiresAt ?? null,
+    testMode: res?.testMode === true,
+  };
 }
 
-/** Sends Checkout's `handler` response for server-side verification. Idempotent. */
-export async function verifyOrderPayment(
-  orderNumber: string,
-  orderToken: string,
-  body: VerifyPaymentInput
-): Promise<GuestOrder> {
+/**
+ * Asks the server to check Cashfree for this order's payment and settle it (no client-side
+ * signature: the server reads the gateway API). Idempotent and safe to poll.
+ * - 200 ⇒ the authoritative order (paid, or already paid)
+ * - 409 `payment_pending` ⇒ a payment is still processing — poll again
+ * - 400 `payment_not_completed` ⇒ no successful/pending payment — the customer can retry
+ */
+export async function verifyOrderPayment(orderNumber: string, orderToken: string): Promise<GuestOrder> {
   const res = await apiRequest<GuestOrder>(`${orderPath(orderNumber)}/pay/verify`, {
     method: 'POST',
     headers: tokenHeader(orderToken),
-    body,
+    body: {},
   });
   return normalizeGuestOrder(res);
 }
@@ -249,6 +266,32 @@ export function readOrderTokenFromHash(hash: string = window.location.hash): str
   const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
   const token = params.get('t');
   return token && token.trim() ? token.trim() : null;
+}
+
+/**
+ * The Cashfree `return_url` can't carry the guest token (it would be sent to Cashfree), so before
+ * opening checkout the token is stashed in this tab's sessionStorage and recovered when the
+ * customer is redirected back (`?page=order&order=…&cf_return=1`, no fragment). Storage can be
+ * unavailable (private mode / blocked) — every access is best-effort. The copy is tab-scoped and
+ * deliberately kept until the tab closes: the page may still need it if the URL lost its fragment.
+ */
+const orderTokenStorageKey = (orderNumber: string) => `zm_order_token:${orderNumber}`;
+
+export function rememberOrderToken(orderNumber: string, orderToken: string): void {
+  try {
+    window.sessionStorage.setItem(orderTokenStorageKey(orderNumber), orderToken);
+  } catch {
+    // Storage unavailable — the modal flow doesn't need it; only a redirect return would.
+  }
+}
+
+export function recallOrderToken(orderNumber: string): string | null {
+  try {
+    const token = window.sessionStorage.getItem(orderTokenStorageKey(orderNumber));
+    return token && token.trim() ? token.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 /** RFC 4122 v4 id for `idempotencyKey`; falls back for non-secure contexts without `randomUUID`. */

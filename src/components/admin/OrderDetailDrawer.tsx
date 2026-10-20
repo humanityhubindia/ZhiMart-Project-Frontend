@@ -90,7 +90,7 @@ function buildTimeline(o: Order): TimelineEvent[] {
     ev.push({
       at: o.payment.paidAt,
       label: 'Payment received',
-      detail: [paymentMethodSummary(o.payment), o.payment.razorpayPaymentId ?? o.payment.reference].filter(Boolean).join(' · '),
+      detail: [paymentMethodSummary(o.payment), o.payment.gatewayPaymentId ?? o.payment.reference].filter(Boolean).join(' · '),
       tone: 'done',
     });
   if (o.shipping.dispatchedAt)
@@ -176,7 +176,7 @@ function OrderBody({ order, isFetching, onRefresh }: { order: Order; isFetching:
           <div>
             <p className="font-black">Payment needs attention</p>
             <p className="mt-0.5">{order.payment.attention}</p>
-            <p className="mt-1 text-rose-700">Check Payment history and the Razorpay dashboard, then refund or contact the customer.</p>
+            <p className="mt-1 text-rose-700">Check Payment history and the Cashfree Merchant Dashboard, then refund or contact the customer.</p>
           </div>
         </div>
       )}
@@ -204,7 +204,7 @@ function OrderBody({ order, isFetching, onRefresh }: { order: Order; isFetching:
             </p>
             <p className="mt-0.5">
               Stock is reserved until {formatDateTime(order.paymentExpiresAt)}. The order moves to Pending Pack automatically
-              once Razorpay confirms payment; if the window closes it is cancelled and stock released. It cannot be dispatched
+              once Cashfree confirms payment; if the window closes it is cancelled and stock released. It cannot be dispatched
               yet, but you can cancel it to release stock now.
             </p>
           </div>

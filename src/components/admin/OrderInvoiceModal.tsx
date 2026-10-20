@@ -219,8 +219,8 @@ export function OrderInvoiceModal({ order, onClose }: { order: Order | null; onC
                     ['Dispatched', order.shipping.dispatchedAt ? formatDateTime(order.shipping.dispatchedAt) : '—'],
                     ['Payment method', paymentMethodSummary(order.payment)],
                     ['Payment status', PAYMENT_STATUS_META[order.payment.status].label],
-                    ...(order.payment.razorpayPaymentId
-                      ? [['Payment ID', order.payment.razorpayPaymentId]]
+                    ...(order.payment.gatewayPaymentId
+                      ? [['Payment ID', order.payment.gatewayPaymentId]]
                       : order.payment.reference
                         ? [['Payment ref', order.payment.reference]]
                         : []),

@@ -42,12 +42,24 @@ export function normalizePricing(raw: Partial<PricingRules> | undefined): Pricin
   };
 }
 
-/** `GET /storefront/config` — public storefront settings (the Razorpay key id is public by design). */
+/** Online payment gateway the server uses (only Cashfree today). */
+export type PaymentGateway = 'cashfree';
+
+/** Cashfree JS SDK mode — must match the server's `CASHFREE_ENV`. */
+export type CashfreeMode = 'sandbox' | 'production';
+
+const toCashfreeMode = (raw: unknown): CashfreeMode | null =>
+  raw === 'sandbox' || raw === 'production' ? raw : null;
+
+/** `GET /storefront/config` — public storefront settings (nothing secret: no gateway keys). */
 export interface StorefrontConfig {
   testMode: boolean;
-  /** `RAZORPAY_ENABLED`: false ⇒ orders are "pay later" (team confirms payment by phone). */
+  /** `CASHFREE_ENABLED`: false ⇒ orders are "pay later" (team confirms payment by phone). */
   onlinePaymentsEnabled: boolean;
-  razorpayKeyId: string | null;
+  /** `cashfree` when online payments are on, null otherwise. */
+  paymentGateway: PaymentGateway | null;
+  /** SDK mode for the storefront (null when online payments are off). */
+  cashfreeMode: CashfreeMode | null;
   currency: string;
   paymentExpiryMinutes: number;
   storeName: string;
@@ -118,7 +130,8 @@ export async function fetchStorefrontConfig(signal?: AbortSignal): Promise<Store
   return {
     testMode: res?.testMode === true,
     onlinePaymentsEnabled: res?.onlinePaymentsEnabled === true,
-    razorpayKeyId: res?.razorpayKeyId ?? null,
+    paymentGateway: res?.paymentGateway === 'cashfree' ? 'cashfree' : null,
+    cashfreeMode: toCashfreeMode(res?.cashfreeMode),
     currency: res?.currency ?? 'INR',
     paymentExpiryMinutes: Number(res?.paymentExpiryMinutes) || 30,
     storeName: res?.storeName || 'Zhi-Mart Fireworks',

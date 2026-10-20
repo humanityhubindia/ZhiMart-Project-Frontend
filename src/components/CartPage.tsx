@@ -456,7 +456,7 @@ export const CartPage: React.FC<CartPageProps> = ({
                   </div>
                 )}
 
-                {/* Delivery details → POST /orders → order page (Razorpay payment there when online payments are on) */}
+                {/* Delivery details → POST /orders → order page (Cashfree payment there when online payments are on) */}
                 <form onSubmit={handlePlaceOrder} noValidate className="space-y-3 pt-2 border-t border-slate-100">
                   <h3 className="text-xs font-black text-slate-800 uppercase tracking-wide">
                     Dispatch & Shipping Address

@@ -48,7 +48,7 @@ export function useProducts() {
 
 export const STOREFRONT_CONFIG_QUERY_KEY = ['storefront-config'] as const;
 
-/** `GET /storefront/config` (test mode flag, Razorpay key id, store name). */
+/** `GET /storefront/config` (test mode flag, payment gateway + Cashfree mode, store name). */
 export function useStorefrontConfig() {
   return useQuery<StorefrontConfig>({
     queryKey: STOREFRONT_CONFIG_QUERY_KEY,
@@ -61,7 +61,7 @@ export function useStorefrontConfig() {
 }
 
 /**
- * Whether checkout takes online (Razorpay) payment. `undefined` while the config is loading or
+ * Whether checkout takes online (Cashfree) payment. `undefined` while the config is loading or
  * unavailable — show neutral copy then, and let the order's own status decide what happens next.
  */
 export function useOnlinePaymentsEnabled(): boolean | undefined {

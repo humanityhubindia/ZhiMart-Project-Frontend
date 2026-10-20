@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isApiError } from '../lib/api';
-import { GuestOrder, startOrderPayment, verifyOrderPayment } from '../lib/ordersApi';
-import { loadRazorpayCheckout } from '../lib/razorpay';
+import { loadCashfreeSdk, openCashfreeCheckout } from '../lib/cashfree';
+import {
+  GuestOrder,
+  rememberOrderToken,
+  startOrderPayment,
+  verifyOrderPayment,
+} from '../lib/ordersApi';
 
 /**
  * - `idle`: nothing in progress
- * - `preparing`: creating/reusing the Razorpay order and loading Checkout
- * - `open`: Razorpay Checkout modal is open
- * - `verifying`: Checkout reported success; server is verifying the signature + payment
- * - `confirming`: waiting for the server (webhook) to settle the payment — the page polls
+ * - `preparing`: creating/reusing the Cashfree order and loading the SDK
+ * - `open`: Cashfree Checkout pop-up is open
+ * - `verifying`: Checkout closed; the server is checking the payment with Cashfree
+ * - `confirming`: Cashfree reports the payment as still processing — the hook polls verify
  * - `confirm_timeout`: still unsettled after polling for a while
  */
 export type PaymentPhase = 'idle' | 'preparing' | 'open' | 'verifying' | 'confirming' | 'confirm_timeout';
@@ -18,7 +23,38 @@ export interface PaymentNotice {
   message: string;
 }
 
+/** How long to keep polling verify while a payment is processing (UPI collect can take a while). */
 const CONFIRM_POLL_WINDOW_MS = 2 * 60_000;
+/** Verify poll interval — well inside the server's per-order rate limit. */
+const CONFIRM_POLL_INTERVAL_MS = 5_000;
+
+const NOT_COMPLETED_MESSAGE = 'The payment was not completed. You can try again.';
+
+/** Phases in which a new checkout must never be opened (it could charge the customer twice). */
+const BUSY_PHASES: readonly PaymentPhase[] = ['preparing', 'open', 'verifying', 'confirming'];
+
+/**
+ * What Checkout reported — used only to word the message. The outcome itself always comes from
+ * the server, which reads Cashfree's API (`paymentDetails` arrives for failed attempts too).
+ */
+interface CheckoutOutcome {
+  /** The customer finished an attempt (`paymentDetails`), as opposed to closing the pop-up. */
+  completedAttempt: boolean;
+  message: string | null;
+}
+
+const cleanMessage = (raw: unknown): string | null => {
+  if (typeof raw !== 'string') return null;
+  const msg = raw.trim().replace(/[.\s]+$/, '');
+  return msg ? msg.slice(0, 200) : null;
+};
+
+function outcomeOf(result: CashfreeCheckoutResult): CheckoutOutcome {
+  if (result.paymentDetails) {
+    return { completedAttempt: true, message: cleanMessage(result.paymentDetails.paymentMessage) };
+  }
+  return { completedAttempt: false, message: cleanMessage(result.error?.message) };
+}
 
 interface UseOrderPaymentOptions {
   orderNumber: string;
@@ -40,23 +76,30 @@ export function useOrderPayment({
 }: UseOrderPaymentOptions) {
   const [phase, setPhaseState] = useState<PaymentPhase>('idle');
   const [notice, setNotice] = useState<PaymentNotice | null>(null);
-  /** Last `payment.failed` reason from Checkout (cleared when a new attempt starts). */
+  /** Why the last completed attempt failed (cleared when a new attempt starts). */
   const [failureReason, setFailureReason] = useState<string | null>(null);
 
   const phaseRef = useRef<PaymentPhase>('idle');
-  const rzpRef = useRef<RazorpayInstance | null>(null);
-  const confirmTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
+  /**
+   * Bumped by every new attempt / check / settle / unmount. Async work captures the value it
+   * started with and drops its result when it no longer matches, so a slow response from an
+   * earlier attempt can never overwrite a newer state (or touch an unmounted component).
+   */
+  const runIdRef = useRef(0);
+  const pollTimerRef = useRef<number | null>(null);
+  /** End of the current confirming window (ms epoch). */
+  const confirmDeadlineRef = useRef(0);
 
   const setPhase = useCallback((next: PaymentPhase) => {
     phaseRef.current = next;
     if (mountedRef.current) setPhaseState(next);
   }, []);
 
-  const clearConfirmTimer = () => {
-    if (confirmTimerRef.current !== null) {
-      window.clearTimeout(confirmTimerRef.current);
-      confirmTimerRef.current = null;
+  const clearPollTimer = () => {
+    if (pollTimerRef.current !== null) {
+      window.clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
     }
   };
 
@@ -64,80 +107,157 @@ export function useOrderPayment({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      clearConfirmTimer();
-      try {
-        rzpRef.current?.close();
-      } catch {
-        // Checkout already closed.
-      }
+      runIdRef.current += 1;
+      clearPollTimer();
+      // The Cashfree SDK has no close() — a pop-up still open is simply orphaned; its result is
+      // ignored (stale run) and the order page re-reads the server state next time.
     };
   }, []);
 
-  /** Poll the order (the page drives polling while phase === 'confirming') for up to 2 minutes. */
-  const startConfirming = useCallback(() => {
-    clearConfirmTimer();
-    setPhase('confirming');
-    confirmTimerRef.current = window.setTimeout(() => {
-      if (phaseRef.current === 'confirming') setPhase('confirm_timeout');
-    }, CONFIRM_POLL_WINDOW_MS);
+  // The poll timer calls the latest verify through a ref (verify ⇄ poll would otherwise be circular).
+  const verifyRef = useRef<(runId: number, outcome: CheckoutOutcome | null) => Promise<void>>(async () => {});
+
+  /**
+   * Keep (or start) confirming and schedule the next verify. Polls are chained — the next one is
+   * scheduled only after the previous response — so requests never overlap.
+   */
+  const pollAgain = useCallback(
+    (runId: number, delayMs: number = CONFIRM_POLL_INTERVAL_MS) => {
+      clearPollTimer();
+      if (phaseRef.current !== 'confirming') {
+        confirmDeadlineRef.current = Date.now() + CONFIRM_POLL_WINDOW_MS;
+        setPhase('confirming');
+      }
+      const remaining = confirmDeadlineRef.current - Date.now();
+      if (remaining <= 0) {
+        setPhase('confirm_timeout');
+        return;
+      }
+      pollTimerRef.current = window.setTimeout(() => {
+        pollTimerRef.current = null;
+        if (runId !== runIdRef.current || phaseRef.current !== 'confirming') return;
+        // At the deadline this is the final check; a still-pending answer then times out above.
+        void verifyRef.current(runId, null);
+      }, Math.min(delayMs, remaining));
+    },
+    [setPhase]
+  );
+
+  /** Stops confirming and returns to idle. */
+  const finish = useCallback(() => {
+    clearPollTimer();
+    setPhase('idle');
   }, [setPhase]);
 
-  /** The page calls this once the server shows the order is no longer awaiting payment. */
-  const settle = useCallback(() => {
-    clearConfirmTimer();
-    if (phaseRef.current !== 'open') setPhase('idle');
-  }, [setPhase]);
-
-  const handleVerify = useCallback(
-    async (resp: RazorpaySuccessResponse) => {
+  const verify = useCallback(
+    async (runId: number, outcome: CheckoutOutcome | null) => {
       if (!orderToken) return;
-      setPhase('verifying');
-      setFailureReason(null);
-      setNotice(null);
+      const isStale = () => !mountedRef.current || runId !== runIdRef.current;
       try {
-        const order = await verifyOrderPayment(orderNumber, orderToken, {
-          razorpayOrderId: resp.razorpay_order_id,
-          razorpayPaymentId: resp.razorpay_payment_id,
-          razorpaySignature: resp.razorpay_signature,
-        });
+        const order = await verifyOrderPayment(orderNumber, orderToken);
+        if (isStale()) return;
+        setNotice(null);
+        setFailureReason(null);
         onOrderUpdate(order);
-        setPhase('idle');
+        finish();
       } catch (err) {
+        if (isStale()) return;
         const code = isApiError(err) ? err.code : null;
-        if (code === 'order_already_paid') {
-          setPhase('idle');
+        if (code === 'payment_pending') {
+          pollAgain(runId);
+        } else if (code === 'payment_not_completed') {
+          finish();
+          if (outcome?.completedAttempt) {
+            // Shown as "Payment failed: <reason>. If any amount was deducted…"
+            setFailureReason(outcome.message ?? 'The payment did not go through');
+          } else {
+            setNotice({
+              tone: 'info',
+              message: outcome?.message ? `The payment was not completed (${outcome.message}). You can try again.` : NOT_COMPLETED_MESSAGE,
+            });
+          }
+        } else if (code === 'order_already_paid') {
+            finish();
           onRefresh();
         } else if (code === 'online_payments_disabled') {
-          setPhase('idle');
+          finish();
           onPaymentsDisabled();
         } else if (code === 'order_expired') {
-          setPhase('idle');
+          finish();
           setNotice({
             tone: 'error',
             message:
               'The payment window had already closed, so this order could not be completed. If money was deducted, it will be refunded automatically.',
           });
           onRefresh();
+        } else if (code === 'order_not_payable') {
+          finish();
+          setNotice({ tone: 'error', message: 'This order can no longer be paid.' });
+          onRefresh();
+        } else if (code === 'not_found') {
+          finish();
+          setNotice({ tone: 'error', message: "We couldn't find this order. Please check that you opened the full order link." });
         } else if (code === 'payment_verification_failed') {
           setNotice({
             tone: 'error',
             message:
               "We couldn't confirm this payment. If money was deducted it will be confirmed automatically or refunded.",
           });
-          startConfirming();
+          pollAgain(runId);
+        } else if (code === 'too_many_requests') {
+          const retryMs = isApiError(err) && err.retryAfter ? err.retryAfter * 1000 : 0;
+          pollAgain(runId, Math.max(CONFIRM_POLL_INTERVAL_MS, retryMs));
         } else {
-          // Network error / timeout / 5xx: the webhook may still settle it — never report failure here.
-          startConfirming();
+          // Network error / timeout / 5xx / gateway hiccup: the payment may well have succeeded
+          // (a webhook can settle it too) — never report failure here, keep checking.
+          pollAgain(runId);
         }
       }
     },
-    [orderNumber, orderToken, onOrderUpdate, onRefresh, onPaymentsDisabled, setPhase, startConfirming]
+    [orderNumber, orderToken, onOrderUpdate, onRefresh, onPaymentsDisabled, finish, pollAgain]
   );
+  verifyRef.current = verify;
+
+  /** Restart confirming (the page's "Check again" button): verify now, then poll for 2 more minutes. */
+  const startConfirming = useCallback(() => {
+    if (!orderToken) return;
+    if (phaseRef.current === 'preparing' || phaseRef.current === 'open' || phaseRef.current === 'verifying') return;
+    const runId = ++runIdRef.current;
+    clearPollTimer();
+    confirmDeadlineRef.current = Date.now() + CONFIRM_POLL_WINDOW_MS;
+    setPhase('confirming');
+    void verify(runId, null);
+  }, [orderToken, setPhase, verify]);
+
+  /**
+   * Ask the server once whether the order was paid — used when the customer comes back from a
+   * Cashfree redirect (`cf_return=1`), where there is no Checkout result to go on.
+   */
+  const checkPayment = useCallback(() => {
+    if (!orderToken || BUSY_PHASES.includes(phaseRef.current)) return;
+    const runId = ++runIdRef.current;
+    clearPollTimer();
+    setNotice(null);
+    setPhase('verifying');
+    void verify(runId, null);
+  }, [orderToken, setPhase, verify]);
+
+  /** The page calls this once the server shows the order is no longer awaiting payment. */
+  const settle = useCallback(() => {
+    // An open pop-up resolves on its own; its verify then reports `order_already_paid` or the order.
+    if (phaseRef.current === 'open') return;
+    runIdRef.current += 1;
+    finish();
+  }, [finish]);
 
   const pay = useCallback(async () => {
     if (!orderToken) return;
-    if (phaseRef.current === 'preparing' || phaseRef.current === 'open' || phaseRef.current === 'verifying') return;
+    // phaseRef is updated synchronously, so a double click / auto-pay race can't open two pop-ups.
+    if (BUSY_PHASES.includes(phaseRef.current)) return;
 
+    const runId = ++runIdRef.current;
+    const isStale = () => !mountedRef.current || runId !== runIdRef.current;
+    clearPollTimer();
     setPhase('preparing');
     setNotice(null);
     setFailureReason(null);
@@ -146,6 +266,7 @@ export function useOrderPayment({
     try {
       session = await startOrderPayment(orderNumber, orderToken);
     } catch (err) {
+      if (isStale()) return;
       setPhase('idle');
       const code = isApiError(err) ? err.code : null;
       if (code === 'online_payments_disabled') {
@@ -177,11 +298,12 @@ export function useOrderPayment({
       }
       return;
     }
+    if (isStale()) return;
 
-    let Razorpay: RazorpayConstructor;
     try {
-      Razorpay = await loadRazorpayCheckout();
+      await loadCashfreeSdk();
     } catch (err) {
+      if (isStale()) return;
       setPhase('idle');
       setNotice({
         tone: 'error',
@@ -189,46 +311,37 @@ export function useOrderPayment({
       });
       return;
     }
-    if (!mountedRef.current) return;
+    if (isStale()) return;
 
-    const rzp = new Razorpay({
-      key: session.keyId,
-      order_id: session.razorpayOrderId,
-      amount: session.amountPaise,
-      currency: session.currency,
-      name: session.name,
-      description: session.description,
-      prefill: {
-        name: session.prefill?.name ?? undefined,
-        email: session.prefill?.email ?? undefined,
-        contact: session.prefill?.contact ?? undefined,
-      },
-      notes: session.notes,
-      theme: { color: '#0f172a' },
-      retry: { enabled: true },
-      modal: {
-        confirm_close: true,
-        ondismiss: () => {
-          if (phaseRef.current !== 'open') return; // handler already took over
-          setPhase('idle');
-          onRefresh();
-        },
-      },
-      handler: (resp) => {
-        void handleVerify(resp);
-      },
-    });
-    rzp.on('payment.failed', (resp) => {
-      const reason =
-        resp?.error?.description ||
-        resp?.error?.reason?.replace(/_/g, ' ') ||
-        'The payment did not go through.';
-      if (mountedRef.current) setFailureReason(reason);
-    });
-    rzpRef.current = rzp;
+    // If the SDK falls back to a full-page redirect (in-app browsers), the return URL carries no
+    // token — keep it in this tab so the order page can recover it on the way back.
+    rememberOrderToken(orderNumber, orderToken);
     setPhase('open');
-    rzp.open();
-  }, [orderNumber, orderToken, onRefresh, onPaymentsDisabled, setPhase, handleVerify]);
+
+    let result: CashfreeCheckoutResult;
+    try {
+      result = await openCashfreeCheckout(session.mode, session.paymentSessionId);
+    } catch (err) {
+      // Couldn't open (or crashed mid-way). Still ask the server — it's the source of truth.
+      result = { error: { message: err instanceof Error ? err.message : undefined } };
+    }
+    if (isStale()) return;
+
+    if (result.redirect && !result.error && !result.paymentDetails) {
+      // The SDK is taking the customer to Cashfree's hosted page; they come back via return_url
+      // (`cf_return=1`) and the page verifies then.
+      setPhase('idle');
+      setNotice({
+        tone: 'info',
+        message: "Continue your payment on Cashfree's secure page. You'll be brought back here when it's done.",
+      });
+      return;
+    }
+
+    // Paid, failed or closed: whatever Checkout says, the server decides.
+    setPhase('verifying');
+    await verify(runId, outcomeOf(result));
+  }, [orderNumber, orderToken, onRefresh, onPaymentsDisabled, setPhase, verify]);
 
   return {
     phase,
@@ -237,6 +350,7 @@ export function useOrderPayment({
     pay,
     settle,
     startConfirming,
+    checkPayment,
     dismissNotice: () => setNotice(null),
   };
 }

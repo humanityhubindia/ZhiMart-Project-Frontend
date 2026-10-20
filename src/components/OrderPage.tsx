@@ -35,10 +35,15 @@ import { BillingLines } from './CheckoutParts';
 
 interface OrderPageProps {
   orderNumber: string;
-  /** Guest token from the URL fragment (`#t=`). Never put it anywhere else. */
+  /**
+   * Guest token from the URL fragment (`#t=`), or this tab's sessionStorage copy after a Cashfree
+   * redirect. Never put it anywhere else (query string, analytics, logs).
+   */
   orderToken: string | null;
-  /** Open Razorpay Checkout as soon as the order loads (right after checkout). */
+  /** Open Cashfree Checkout as soon as the order loads (right after checkout). */
   autoPay?: boolean;
+  /** Back from Cashfree's hosted page (`cf_return=1`): ask the server for the payment outcome once. */
+  returnedFromGateway?: boolean;
   /** Email typed at checkout in this session (memory only) — shown masked. */
   confirmationEmail?: string | null;
   /** What the cart showed at checkout in this session (memory only). The server's figures win. */
@@ -72,7 +77,7 @@ const INSTRUMENT_LABELS: Record<string, string> = {
   netbanking: 'Net Banking',
   wallet: 'Wallet',
   emi: 'EMI',
-  paylater: 'Pay Later (via Razorpay)',
+  paylater: 'Pay Later (online)',
   bank_transfer: 'Bank Transfer',
 };
 
@@ -115,6 +120,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
   orderNumber,
   orderToken,
   autoPay,
+  returnedFromGateway,
   confirmationEmail,
   clientEstimate,
   onShopAgain,
@@ -133,8 +139,8 @@ export const OrderPage: React.FC<OrderPageProps> = ({
     [queryClient, orderNumber]
   );
 
-  // Online payments can be switched off server-side (`RAZORPAY_ENABLED=false`): orders are then
-  // "pay later" and Razorpay is never loaded.
+  // Online payments can be switched off server-side (`CASHFREE_ENABLED=false`): orders are then
+  // "pay later" and the Cashfree SDK is never loaded.
   const onlinePaymentsEnabled = useOnlinePaymentsEnabled();
   const [disabledByServer, setDisabledByServer] = useState(false);
   const paymentsOff = disabledByServer || onlinePaymentsEnabled === false;
@@ -146,7 +152,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
   }, [queryClient, orderNumber]);
 
   const payment = useOrderPayment({ orderNumber, orderToken, onOrderUpdate, onRefresh: refresh, onPaymentsDisabled });
-  const { settle, pay } = payment;
+  const { settle, pay, checkPayment } = payment;
   const confirming = payment.phase === 'confirming';
 
   const orderQuery = useQuery<GuestOrder>({
@@ -156,9 +162,10 @@ export const OrderPage: React.FC<OrderPageProps> = ({
     staleTime: 0,
     refetchOnWindowFocus: true,
     retry: (count, err) => !(isApiError(err) && err.status >= 400 && err.status < 500) && count < 3,
-    // Poll fast while the webhook settles a payment; slowly while simply awaiting payment.
+    // While confirming, the payment hook polls verify (which returns the order); this slower read
+    // is a fallback that also picks up a webhook settling it. Slow poll while simply awaiting payment.
     refetchInterval: (query) => {
-      if (confirming) return 3_000;
+      if (confirming) return 10_000;
       return query.state.data?.status === 'pending_payment' && !paymentsOff ? 30_000 : false;
     },
   });
@@ -187,13 +194,22 @@ export const OrderPage: React.FC<OrderPageProps> = ({
     }
   }, [locallyExpired, refresh]);
 
-  // Right after checkout: open Razorpay once, as soon as the order is known to be payable.
+  // Right after checkout: open Cashfree once, as soon as the order is known to be payable.
   const autoPayDone = useRef(false);
   useEffect(() => {
     if (!autoPay || autoPayDone.current || !order) return;
     autoPayDone.current = true;
     if (order.status === 'pending_payment' && !locallyExpired && !paymentsOff) void pay();
   }, [autoPay, order, locallyExpired, paymentsOff, pay]);
+
+  // Back from a Cashfree redirect: settle with the server once (never re-open checkout here).
+  // Already-settled orders need nothing — the page simply shows them.
+  const returnCheckDone = useRef(false);
+  useEffect(() => {
+    if (!returnedFromGateway || returnCheckDone.current || !order) return;
+    returnCheckDone.current = true;
+    if (order.status === 'pending_payment' && !paymentsOff) checkPayment();
+  }, [returnedFromGateway, order, paymentsOff, checkPayment]);
 
   const copyLink = async () => {
     try {
@@ -419,7 +435,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
                   <div className="space-y-1">
                     <h2 className="text-lg font-black text-slate-900">Complete your payment</h2>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Your items are reserved. Pay securely with UPI, cards or net banking via Razorpay.
+                      Your items are reserved. Pay securely with UPI, cards, net banking or wallets via Cashfree.
                     </p>
                   </div>
                   {msLeft !== null && (
@@ -467,7 +483,7 @@ export const OrderPage: React.FC<OrderPageProps> = ({
                 </button>
                 <p className="text-[10px] text-slate-500 text-center flex items-center justify-center gap-1">
                   <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                  Payments are processed by Razorpay. We never see your card or UPI PIN.
+                  Payments are processed securely by Cashfree. We never see your card details or UPI PIN.
                 </p>
               </div>
             </Panel>

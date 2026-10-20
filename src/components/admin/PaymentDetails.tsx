@@ -1,16 +1,15 @@
 import React, { useState } from 'react';
-import { Check, Copy, CreditCard, ExternalLink, ReceiptText, RotateCcw, Undo2, XCircle } from 'lucide-react';
+import { Check, Copy, CreditCard, ReceiptText, RotateCcw, Undo2, XCircle } from 'lucide-react';
 import { usePaymentEvents } from '../../hooks/admin/adminQueries';
 import type { Order, PaymentAction } from '../../types/admin';
 import {
   formatDateTime,
   formatINR,
+  gatewayDashboardName,
   paymentMethodSummary,
-  razorpayOrderUrl,
-  razorpayPaymentUrl,
   refundableAmount,
 } from './format';
-import { availablePaymentActions, canRefundOnline, PAYMENT_ACTION_LABEL } from './OrderActionDialogs';
+import { availablePaymentActions, canRefundOnline, legacyGatewayRefundHint, PAYMENT_ACTION_LABEL } from './OrderActionDialogs';
 import { useToast } from './Toast';
 import { Button, ErrorCard, PaymentStatusBadge, Skeleton } from './ui';
 
@@ -39,24 +38,17 @@ export function CopyButton({ value, label }: { value: string; label: string }) {
   );
 }
 
-/** Monospace id with copy + "open in Razorpay dashboard" link. */
-export function RazorpayId({ id, href, label }: { id: string; href: string; label: string }) {
+/**
+ * Monospace gateway id with a copy button. The Cashfree Merchant Dashboard has no stable deep
+ * links, so the tooltip says where to paste it instead of linking.
+ */
+export function GatewayId({ id, label, dashboard }: { id: string; label: string; dashboard: string }) {
   return (
     <span className="inline-flex items-center gap-0.5 max-w-full">
-      <span className="font-mono text-[11px] truncate" title={id}>
+      <span className="font-mono text-[11px] truncate" title={`${id} — search it in the ${dashboard}`}>
         {id}
       </span>
       <CopyButton value={id} label={label} />
-      <a
-        href={href}
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label={`Open ${label} in the Razorpay dashboard`}
-        title="Open in Razorpay dashboard"
-        className="p-1 rounded-md text-slate-400 hover:text-blue-700 hover:bg-blue-50 shrink-0"
-      >
-        <ExternalLink className="w-3.5 h-3.5" />
-      </a>
     </span>
   );
 }
@@ -94,14 +86,14 @@ export function PaymentPanel({
         <Row label="Method">{paymentMethodSummary(p)}</Row>
         <Row label="Amount">{formatINR(order.totalAmount)}</Row>
         {p.paidAt && <Row label="Paid">{formatDateTime(p.paidAt)}</Row>}
-        {p.razorpayOrderId && (
-          <Row label="Razorpay order">
-            <RazorpayId id={p.razorpayOrderId} href={razorpayOrderUrl(p.razorpayOrderId)} label="Razorpay order id" />
+        {p.gatewayOrderId && (
+          <Row label="Gateway order">
+            <GatewayId id={p.gatewayOrderId} label="gateway order id" dashboard={gatewayDashboardName(p.method)} />
           </Row>
         )}
-        {p.razorpayPaymentId && (
-          <Row label="Razorpay payment">
-            <RazorpayId id={p.razorpayPaymentId} href={razorpayPaymentUrl(p.razorpayPaymentId)} label="Razorpay payment id" />
+        {p.gatewayPaymentId && (
+          <Row label="Gateway payment">
+            <GatewayId id={p.gatewayPaymentId} label="gateway payment id" dashboard={gatewayDashboardName(p.method)} />
           </Row>
         )}
         {p.reference && (
@@ -124,6 +116,11 @@ export function PaymentPanel({
           {order.payment.method === 'pay_later'
             ? 'Pay-later order — collect the payment (UPI, bank transfer or cash), then record it here with the UTR / reference.'
             : 'Payment not yet received — record it once collected.'}
+        </p>
+      )}
+      {legacyGatewayRefundHint(order) && (
+        <p className="mt-3 p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-[11px] font-bold text-slate-700">
+          {legacyGatewayRefundHint(order)}
         </p>
       )}
       {(canRefundOnline(order) || manual.length > 0) && (
@@ -194,11 +191,11 @@ export function PaymentHistoryPanel({ orderId }: { orderId: string }) {
                     {r.failureReason && <p className="text-rose-700 font-bold mt-0.5">{r.failureReason}</p>}
                     <p className="text-[11px] text-slate-400 mt-0.5 flex flex-wrap items-center gap-x-1">
                       {formatDateTime(r.createdAt)} · {r.adminEmail ? `by ${r.adminEmail}` : 'automatic'}
-                      {r.razorpayRefundId && (
+                      {r.gatewayRefundId && (
                         <>
                           {' · '}
-                          <span className="font-mono">{r.razorpayRefundId}</span>
-                          <CopyButton value={r.razorpayRefundId} label="Razorpay refund id" />
+                          <span className="font-mono">{r.gatewayRefundId}</span>
+                          <CopyButton value={r.gatewayRefundId} label="gateway refund id" />
                         </>
                       )}
                     </p>

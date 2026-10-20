@@ -13,6 +13,7 @@ import { MANUAL_PAYMENT_METHODS } from '../../types/admin';
 import {
   formatCount,
   formatINR,
+  isOnlinePaymentMethod,
   nextOrderStatuses,
   ORDER_CONFLICT_MESSAGE,
   ORDER_STATUS_META,
@@ -429,9 +430,12 @@ export function OrderCancelDialog({ order, open, onClose }: { order: Order; open
 // Payment
 // ---------------------------------------------------------------------------
 
-/** Manual payment actions — only for legacy/manual methods; Razorpay payments use refunds. */
+/**
+ * Manual payment actions — only for pay-later/manual methods. Gateway payments (Cashfree, and
+ * legacy Razorpay) are settled by the gateway and reversed with refunds; the server refuses these too.
+ */
 export function availablePaymentActions(order: Order): PaymentAction[] {
-  if (order.payment.method === 'razorpay' || order.status === 'pending_payment') return [];
+  if (isOnlinePaymentMethod(order.payment.method) || order.status === 'pending_payment') return [];
   switch (order.payment.status) {
     case 'pending':
       // A cancelled order cannot be marked paid or failed.
@@ -607,18 +611,29 @@ export function OrderPaymentDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Razorpay refund
+// Cashfree refund
 // ---------------------------------------------------------------------------
 
 const MONEY_RE = /^\d+(\.\d{1,2})?$/;
 
+/**
+ * Refundable through the API: paid Cashfree orders only. Legacy Razorpay payments must be refunded
+ * from the Razorpay Dashboard (the server answers 409 for them) — see `legacyGatewayRefundHint`.
+ */
 export function canRefundOnline(order: Order): boolean {
   return (
-    order.payment.method === 'razorpay' &&
+    order.payment.method === 'cashfree' &&
     order.payment.status === 'paid' &&
-    !!order.payment.razorpayPaymentId &&
+    !!order.payment.gatewayPaymentId &&
     refundableAmount(order) > 0
   );
+}
+
+/** Why a paid legacy Razorpay order has no Refund button (null when not applicable). */
+export function legacyGatewayRefundHint(order: Order): string | null {
+  return order.payment.method === 'razorpay' && order.payment.status === 'paid' && refundableAmount(order) > 0
+    ? 'Paid through Razorpay before the switch to Cashfree — refund it from the Razorpay Dashboard.'
+    : null;
 }
 
 export function OrderRefundDialog({ order, open, onClose }: { order: Order; open: boolean; onClose: () => void }) {
@@ -682,7 +697,7 @@ export function OrderRefundDialog({ order, open, onClose }: { order: Order; open
         onSuccess: (updated) => {
           const fully = updated.payment.status === 'refunded';
           toast.success(
-            `Refund of ${formatINR(refundValue)} for ${updated.orderNumber} sent to Razorpay${fully ? ' — fully refunded' : ''}.`
+            `Refund of ${formatINR(refundValue)} for ${updated.orderNumber} sent to Cashfree${fully ? ' — fully refunded' : ''}.`
           );
           onClose();
         },
@@ -690,7 +705,7 @@ export function OrderRefundDialog({ order, open, onClose }: { order: Order; open
           if (isApiError(err) && err.code === 'payment_gateway_error') {
             setStep('form');
             setFormError(
-              'Razorpay did not confirm the refund (gateway error or timeout). Check Payment history before retrying — a refund may already be pending.'
+              'Cashfree did not confirm the refund (gateway error or timeout). Check Payment history before retrying — a refund may already be pending.'
             );
             return;
           }
@@ -794,8 +809,8 @@ export function OrderRefundDialog({ order, open, onClose }: { order: Order; open
             <FieldError id={`${reasonId}-err`} message={errors.reason} />
           </div>
           <p className="text-[11px] text-slate-500">
-            The refund is issued through Razorpay to the customer&apos;s original payment method
-            {order.payment.razorpayPaymentId ? ` (payment ${order.payment.razorpayPaymentId})` : ''}. Banks usually take
+            The refund is issued through Cashfree to the customer&apos;s original payment method
+            {order.payment.gatewayPaymentId ? ` (payment ${order.payment.gatewayPaymentId})` : ''}. Banks usually take
             5–7 working days.
           </p>
           <FormError message={formError} />
@@ -810,7 +825,7 @@ export function OrderRefundDialog({ order, open, onClose }: { order: Order; open
               {refundValue >= remaining
                 ? 'This refunds everything that remains; the payment will be marked refunded.'
                 : `A partial refund — ${formatINR(Math.round((remaining - refundValue) * 100) / 100)} will remain refundable.`}{' '}
-              Money sent back through Razorpay cannot be recalled.
+              Money sent back through Cashfree cannot be recalled.
             </p>
             <p className="mt-2 text-rose-800">
               <span className="font-bold">Reason:</span> {cleanReason}

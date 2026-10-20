@@ -18,7 +18,7 @@ import { useCrackers } from './hooks/useCrackers';
 import { findProductById, countBy } from './hooks/useProducts';
 import { useCart } from './hooks/useCart';
 import { CheckoutSuccess } from './hooks/useCheckout';
-import { orderPageUrl, readOrderTokenFromHash } from './lib/ordersApi';
+import { orderPageUrl, readOrderTokenFromHash, recallOrderToken } from './lib/ordersApi';
 import { OrderPage } from './components/OrderPage';
 import { TestModeBanner } from './components/TestModeBanner';
 import { BulkUnlockBar } from './components/BulkUnlockBar';
@@ -34,9 +34,41 @@ type Route = {
   type: 'home' | 'product' | 'estimate' | 'cart' | 'ai-assistant' | 'admin' | 'order';
   productId?: string;
   orderNumber?: string;
-  /** Open Razorpay Checkout immediately (only right after checkout, never from a reload/back). */
+  /** Open Cashfree Checkout immediately (only right after checkout, never from a reload/back). */
   autoPay?: boolean;
+  /** Just redirected back from Cashfree's hosted page — verify the payment once. */
+  returnedFromGateway?: boolean;
 };
+
+/**
+ * Cashfree's `return_url` is `?page=order&order=…&cf_return=1` with no fragment (the guest token
+ * must never be sent to Cashfree). On the way back: drop `cf_return` (so a reload or a shared link
+ * doesn't re-trigger it) and put the token stashed in this tab's sessionStorage back into `#t=`,
+ * so the page link works for copy/bookmark again. Runs once per page load — the result is cached
+ * because StrictMode calls state initialisers twice and the first call already cleaned the URL.
+ */
+let cashfreeReturnOrder: string | null | undefined;
+function takeCashfreeReturn(): string | null {
+  if (cashfreeReturnOrder !== undefined) return cashfreeReturnOrder;
+  cashfreeReturnOrder = null;
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('page') !== 'order' || params.get('cf_return') !== '1') return null;
+  const orderNumber = params.get('order') ?? '';
+  params.delete('cf_return');
+  const token = readOrderTokenFromHash() ?? (orderNumber ? recallOrderToken(orderNumber) : null);
+  const hash = token ? `#t=${encodeURIComponent(token)}` : window.location.hash;
+  try {
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}?${params.toString()}${hash}`);
+  } catch {
+    // Some embedded browsers restrict history; the route below still works from memory.
+  }
+  cashfreeReturnOrder = orderNumber || null;
+  return cashfreeReturnOrder;
+}
+
+/** Guest token for the order page: the URL fragment first, then this tab's sessionStorage copy. */
+const orderTokenFor = (orderNumber: string) =>
+  readOrderTokenFromHash() ?? (orderNumber ? recallOrderToken(orderNumber) : null);
 
 export function App() {
   // Read current route from URL query parameters (e.g. ?product=zm-02, ?page=estimate, ?page=cart,
@@ -54,7 +86,13 @@ export function App() {
     return { type: 'home' as const };
   };
 
-  const [currentRoute, setCurrentRoute] = useState<Route>(getRouteFromUrl);
+  const [currentRoute, setCurrentRoute] = useState<Route>(() => {
+    const returnedOrder = takeCashfreeReturn();
+    const route = getRouteFromUrl();
+    return route.type === 'order' && returnedOrder && route.orderNumber === returnedOrder
+      ? { ...route, returnedFromGateway: true }
+      : route;
+  });
 
   // Email typed at checkout, kept in memory only (never stored) so the order page can say where
   // the confirmation went (the GuestOrder API intentionally doesn't return it), plus the cart's
@@ -115,7 +153,7 @@ export function App() {
   const handleOrderCreated = ({ order, orderToken, customer, estimate }: CheckoutSuccess) => {
     setLastCheckout({ orderNumber: order.orderNumber, email: customer.email, estimate });
     window.history.pushState({ page: 'order' }, '', orderPageUrl(order.orderNumber, orderToken));
-    // Pay-later orders (online payments off) arrive as `pending_pack` — never load Razorpay for them.
+    // Pay-later orders (online payments off) arrive as `pending_pack` — never load Cashfree for them.
     setCurrentRoute({
       type: 'order',
       orderNumber: order.orderNumber,
@@ -277,7 +315,8 @@ export function App() {
           <OrderPage
             key={currentRoute.orderNumber}
             orderNumber={currentRoute.orderNumber ?? ''}
-            orderToken={readOrderTokenFromHash()}
+            orderToken={orderTokenFor(currentRoute.orderNumber ?? '')}
+            returnedFromGateway={currentRoute.returnedFromGateway}
             autoPay={currentRoute.autoPay}
             confirmationEmail={
               lastCheckout && lastCheckout.orderNumber === currentRoute.orderNumber ? lastCheckout.email : null

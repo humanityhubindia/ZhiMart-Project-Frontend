@@ -23,7 +23,7 @@ import {
   formatINR,
   PAYMENT_STATUS_META,
   paymentMethodSummary,
-  razorpayPaymentUrl,
+  gatewayDashboardName,
 } from './format';
 import {
   availablePaymentActions,
@@ -33,7 +33,7 @@ import {
   PAYMENT_ACTION_LABEL,
 } from './OrderActionDialogs';
 import { OrderRowsSkeleton } from './AdminOrdersTab';
-import { RazorpayId } from './PaymentDetails';
+import { GatewayId } from './PaymentDetails';
 import {
   AttentionBadge,
   Button,
@@ -112,7 +112,7 @@ export function AdminPaymentsTab({ onOpenOrder }: Props) {
         <h2 className="text-2xl font-black text-slate-950 tracking-tight font-heading">Payments</h2>
         <p className="text-xs text-slate-500 font-semibold mt-0.5">
           {onlinePayments
-            ? 'Online payments are confirmed by Razorpay (verified signature or webhook) — never by the browser. Refund paid Razorpay orders here; pay-later orders are recorded manually.'
+            ? 'Online payments are confirmed with Cashfree by the server (payment API or signed webhook) — never by the browser. Refund paid Cashfree orders here; pay-later orders are recorded manually.'
             : 'Online payments are off — every order is pay-later. Collect by UPI, bank transfer or cash, then use “Record payment” with the UTR / reference.'}
         </p>
       </div>
@@ -288,11 +288,11 @@ export function AdminPaymentsTab({ onOpenOrder }: Props) {
                         </div>
                       </td>
                       <td className="px-4 py-3 max-w-[200px]">
-                        {o.payment.razorpayPaymentId ? (
-                          <RazorpayId
-                            id={o.payment.razorpayPaymentId}
-                            href={razorpayPaymentUrl(o.payment.razorpayPaymentId)}
-                            label="Razorpay payment id"
+                        {o.payment.gatewayPaymentId ? (
+                          <GatewayId
+                            id={o.payment.gatewayPaymentId}
+                            label="gateway payment id"
+                            dashboard={gatewayDashboardName(o.payment.method)}
                           />
                         ) : o.payment.reference ? (
                           <span className="font-mono text-[11px] text-slate-700 break-all">{o.payment.reference}</span>
