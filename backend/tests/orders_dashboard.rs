@@ -79,10 +79,11 @@ fn test_config() -> Config {
         ses_configuration_set: None,
         payments_enabled: true,
         payment_test_mode: false,
-        razorpay_key_id: "rzp_test_0123456789abcd".into(),
-        razorpay_key_secret: SecretString::from("test_key_secret_0123456789"),
-        razorpay_webhook_secret: SecretString::from("test_webhook_secret_0123456789"),
-        razorpay_api_base: "https://api.razorpay.com".into(),
+        cashfree_env: zhimart_backend::config::CashfreeEnv::Sandbox,
+        cashfree_app_id: "TEST1234567890abcdef".into(),
+        cashfree_secret_key: SecretString::from("cfsk_ma_test_0123456789abcdef"),
+        cashfree_api_base: "https://sandbox.cashfree.com/pg".into(),
+        cashfree_notify_url: None,
         payment_expiry: std::time::Duration::from_secs(30 * 60),
         store_name: "Zhi-Mart Fireworks".into(),
         order_notifications_enabled: false,
@@ -257,7 +258,7 @@ impl Harness {
             .expect("order id")
     }
 
-    /// Place an order and simulate a verified Razorpay payment (what the
+    /// Place an order and simulate a verified Cashfree payment (what the
     /// payments service does): `pending_pack` + `paid`, version 2.
     async fn place(&self, phone: &str, items: &[(&str, i64)]) -> Value {
         let o = self.place_unpaid(phone, items).await;
@@ -271,8 +272,8 @@ impl Harness {
             r#"
             UPDATE orders
             SET status = 'pending_pack', payment_status = 'paid', paid_at = now(),
-                razorpay_order_id = 'order_' || substr(md5(id::text), 1, 14),
-                razorpay_payment_id = 'pay_' || substr(md5(id::text), 15, 14),
+                gateway_order_id = order_number || '_' || substr(md5(id::text), 1, 12),
+                gateway_payment_id = (1000000000 + (('x' || substr(md5(id::text), 15, 7))::bit(28)::int))::text,
                 payment_instrument = 'upi', version = version + 1, updated_at = now()
             WHERE id = $1 AND status = 'pending_payment'
             "#,
@@ -1010,11 +1011,11 @@ async fn get_by_id_or_number(pool: PgPool) {
     assert_eq!(
         o["payment"],
         json!({
-            "method": "razorpay", "status": "paid", "reference": null,
+            "method": "cashfree", "status": "paid", "reference": null,
             "paidAt": o["payment"]["paidAt"].clone(), "refundedAt": null,
             "instrument": "upi",
-            "razorpayOrderId": o["payment"]["razorpayOrderId"].clone(),
-            "razorpayPaymentId": o["payment"]["razorpayPaymentId"].clone(),
+            "gatewayOrderId": o["payment"]["gatewayOrderId"].clone(),
+            "gatewayPaymentId": o["payment"]["gatewayPaymentId"].clone(),
             "amountRefunded": 0, "attention": null
         })
     );
@@ -1247,7 +1248,7 @@ async fn payment_flow(pool: PgPool) {
     let h = setup(pool).await;
     add_product(&h.pool, "zm-01", 1_000, 2_000, 50, true).await;
 
-    // Razorpay orders: manual payment actions are refused, paid or not.
+    // Cashfree orders: manual payment actions are refused, paid or not.
     let paid = h.place(&phone(1), &[("zm-01", 1)]).await;
     let unpaid = h.place_unpaid(&phone(2), &[("zm-01", 1)]).await;
     for (o, v) in [(&paid, 2), (&unpaid, 1)] {
@@ -1448,7 +1449,7 @@ async fn dashboard_numbers(pool: PgPool) {
     .await;
     exec(
         "UPDATE orders SET payment_method = 'pay_later', payment_status = 'pending', paid_at = NULL, \
-         razorpay_order_id = NULL, razorpay_payment_id = NULL WHERE id = $1",
+         gateway_order_id = NULL, gateway_payment_id = NULL WHERE id = $1",
         id_of(&o2),
     )
     .await;
@@ -1745,10 +1746,7 @@ async fn large_order_is_charged_list_prices(pool: PgPool) {
     assert_eq!(admin["pricingTier"], "bulk");
     assert_eq!(admin["deliveryFee"], 0);
     let number = o["orderNumber"].as_str().expect("number");
-    assert_eq!(
-        stored_tier(&h, number).await,
-        ("bulk".to_owned(), 600_000)
-    );
+    assert_eq!(stored_tier(&h, number).await, ("bulk".to_owned(), 600_000));
 
     // An idempotent replay returns the same tier and prices.
     let r = h.order(order_body(key, "9840012345", &items)).await;
@@ -2266,7 +2264,7 @@ async fn unpaid_orders_are_hidden_and_guarded(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// Payment switch (RAZORPAY_ENABLED=false ⇒ pay later) & admin notifications
+// Payment switch (CASHFREE_ENABLED=false ⇒ pay later) & admin notifications
 // ---------------------------------------------------------------------------
 
 const OUTBOX_ROWS: &str =
@@ -2393,7 +2391,7 @@ async fn pay_later_mode_without_notifications_and_test_pricing(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn razorpay_mode_does_not_notify_at_placement(pool: PgPool) {
+async fn online_mode_does_not_notify_at_placement(pool: PgPool) {
     let h = setup_with(pool, |c| {
         c.payments_enabled = true;
         c.order_notifications_enabled = true;
@@ -2535,7 +2533,7 @@ async fn customer_confirmation_without_admin_notification(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn razorpay_mode_queues_no_email_at_placement(pool: PgPool) {
+async fn online_mode_queues_no_email_at_placement(pool: PgPool) {
     let h = setup_with(pool, |c| {
         c.payments_enabled = true;
         c.order_notifications_enabled = true;

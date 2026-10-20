@@ -197,9 +197,13 @@ fn route_tree(state: AppState, limiters: &RateLimiters) -> (Router, Router) {
             routes::payments::public_routes(),
             &limiters.payments,
         ))
+        .merge(limited(
+            routes::payments::verify_routes(),
+            &limiters.payment_verify,
+        ))
         .nest("/admin", routes::admin::routes());
 
-    // Razorpay webhooks: authenticated by HMAC signature, delivered in bursts
+    // Cashfree webhooks: authenticated by HMAC signature, delivered in bursts
     // from a few gateway IPs. Kept OUT of the global per-IP /api limiter; only
     // a generous dedicated safety-valve limiter applies. Body limit, timeout,
     // load shedding, security headers and tracing still apply (edge stack).
@@ -820,10 +824,11 @@ mod tests {
             ses_configuration_set: None,
             payments_enabled: true,
             payment_test_mode: false,
-            razorpay_key_id: "rzp_test_0123456789abcd".into(),
-            razorpay_key_secret: SecretString::from("test_key_secret_0123456789"),
-            razorpay_webhook_secret: SecretString::from("test_webhook_secret_0123456789"),
-            razorpay_api_base: "https://api.razorpay.com".into(),
+            cashfree_env: crate::config::CashfreeEnv::Sandbox,
+            cashfree_app_id: "TEST1234567890abcdef".into(),
+            cashfree_secret_key: SecretString::from("cfsk_ma_test_0123456789abcdef"),
+            cashfree_api_base: "https://sandbox.cashfree.com/pg".into(),
+            cashfree_notify_url: None,
             payment_expiry: std::time::Duration::from_secs(30 * 60),
             store_name: "Zhi-Mart Fireworks".into(),
             order_notifications_enabled: false,
@@ -1090,7 +1095,7 @@ mod tests {
         let v1 = Router::new().route("/things", get(|| async { "things" }));
         let webhooks = Router::new()
             .route(
-                "/webhooks/razorpay",
+                "/webhooks/cashfree",
                 axum::routing::post(|| async { "ack" }),
             )
             .route_layer(from_fn_with_state(webhook_limiter, rate_limit::enforce));
@@ -1116,7 +1121,7 @@ mod tests {
         for _ in 0..20 {
             let res = app
                 .clone()
-                .oneshot(req(Method::POST, "/api/v1/webhooks/razorpay"))
+                .oneshot(req(Method::POST, "/api/v1/webhooks/cashfree"))
                 .await
                 .expect("infallible");
             assert_eq!(
@@ -1139,7 +1144,7 @@ mod tests {
         }
 
         // Body limit still applies to the webhook.
-        let mut r = req(Method::POST, "/api/v1/webhooks/razorpay");
+        let mut r = req(Method::POST, "/api/v1/webhooks/cashfree");
         r.headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(4096u32));
         *r.body_mut() = Body::from(vec![b'{'; 4096]);
@@ -1148,10 +1153,32 @@ mod tests {
 
         // Wrong method on the webhook path is a JSON 405, not a panic or 404.
         let res = app
-            .oneshot(req(Method::GET, "/api/v1/webhooks/razorpay"))
+            .oneshot(req(Method::GET, "/api/v1/webhooks/cashfree"))
             .await
             .expect("infallible");
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn cashfree_webhook_is_mounted_outside_the_global_limiter() {
+        // Global limit 4/min (test_config): the old Razorpay path is gone (404),
+        // and the Cashfree webhook keeps answering (400: unsigned) past that limit.
+        let app = full_app(test_config());
+        let res = app
+            .clone()
+            .oneshot(req(Method::POST, "/api/v1/webhooks/razorpay"))
+            .await
+            .expect("infallible");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        for _ in 0..8 {
+            let res = app
+                .clone()
+                .oneshot(req(Method::POST, "/api/v1/webhooks/cashfree"))
+                .await
+                .expect("infallible");
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(res).await["error"]["code"], "validation_error");
+        }
     }
 
     #[tokio::test]

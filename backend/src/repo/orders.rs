@@ -25,7 +25,7 @@ macro_rules! order_cols {
          status, payment_method, payment_status, payment_reference, paid_at, refunded_at, \
          transport_partner, docket_number, dispatched_at, delivered_at, cancelled_at, \
          cancel_reason, version, created_at, updated_at, is_test, payment_expires_at, \
-         razorpay_order_id, razorpay_payment_id, payment_instrument, amount_refunded_paise, \
+         gateway_order_id, gateway_payment_id, payment_instrument, amount_refunded_paise, \
          payment_attention, pricing_tier, delivery_fee_paise"
     };
 }
@@ -106,8 +106,18 @@ impl OrderStatus {
     }
 }
 
-/// Payment method of every order placed through the storefront checkout.
-pub const METHOD_RAZORPAY: &str = "razorpay";
+/// Payment method of every online-payment order placed through the storefront
+/// checkout (Cashfree).
+pub const METHOD_CASHFREE: &str = "cashfree";
+/// Legacy online method: orders paid through Razorpay before the switch to
+/// Cashfree (refund those from the Razorpay Dashboard).
+pub const METHOD_RAZORPAY_LEGACY: &str = "razorpay";
+
+/// `true` for online-gateway methods, whose payment state is owned by the
+/// payment service and never edited manually.
+pub fn is_online_method(method: &str) -> bool {
+    method == METHOD_CASHFREE || method == METHOD_RAZORPAY_LEGACY
+}
 /// `cancel_reason` written by the unpaid-order expiry sweep.
 pub const EXPIRY_CANCEL_REASON: &str = "Payment not completed";
 
@@ -131,7 +141,7 @@ impl PricingTier {
 }
 
 pub const PAYMENT_STATUSES: [&str; 4] = ["pending", "paid", "refunded", "failed"];
-/// Methods an admin may record manually (`mark_paid`) on non-Razorpay orders.
+/// Methods an admin may record manually (`mark_paid`) on offline (non-gateway) orders.
 pub const PAYMENT_METHODS: [&str; 6] = [
     "pay_later",
     "upi",
@@ -179,8 +189,10 @@ pub struct OrderRow {
     pub updated_at: DateTime<Utc>,
     pub is_test: bool,
     pub payment_expires_at: Option<DateTime<Utc>>,
-    pub razorpay_order_id: Option<String>,
-    pub razorpay_payment_id: Option<String>,
+    /// Our Cashfree order id (or a legacy Razorpay `order_…` id).
+    pub gateway_order_id: Option<String>,
+    /// Cashfree `cf_payment_id` of the settled payment (or a legacy `pay_…` id).
+    pub gateway_payment_id: Option<String>,
     pub payment_instrument: Option<String>,
     pub amount_refunded_paise: i64,
     pub payment_attention: Option<String>,
@@ -263,10 +275,10 @@ pub struct Payment {
     pub reference: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
     pub refunded_at: Option<DateTime<Utc>>,
-    /// Instrument Razorpay reported (upi, card, netbanking, wallet, …).
+    /// Instrument the gateway reported (upi, card, netbanking, wallet, …).
     pub instrument: Option<String>,
-    pub razorpay_order_id: Option<String>,
-    pub razorpay_payment_id: Option<String>,
+    pub gateway_order_id: Option<String>,
+    pub gateway_payment_id: Option<String>,
     #[serde(serialize_with = "serialize_rupees")]
     pub amount_refunded: i64,
     /// Non-null when the payment needs human attention.
@@ -350,8 +362,8 @@ impl Order {
                 paid_at: r.paid_at,
                 refunded_at: r.refunded_at,
                 instrument: r.payment_instrument,
-                razorpay_order_id: r.razorpay_order_id,
-                razorpay_payment_id: r.razorpay_payment_id,
+                gateway_order_id: r.gateway_order_id,
+                gateway_payment_id: r.gateway_payment_id,
                 amount_refunded: r.amount_refunded_paise,
                 attention: r.payment_attention,
             },
@@ -748,7 +760,7 @@ pub struct NewOrder<'a> {
     pub is_test: bool,
     /// Tier the lines were priced at by the caller.
     pub pricing_tier: PricingTier,
-    /// `true` (Razorpay enabled): `pending_payment` / `razorpay`, reserved until
+    /// `true` (Cashfree enabled): `pending_payment` / `cashfree`, reserved until
     /// `payment_expires_at = now() + payment_expiry` (DB clock). `false`:
     /// `pending_pack` / `pay_later`, no expiry (payment collected offline).
     pub online_payment: bool,
@@ -793,7 +805,7 @@ struct InsertedOrder {
 pub const IDEMPOTENCY_CONSTRAINT: &str = "orders_idempotency_key";
 
 /// Decrement stock for every line, insert the order (`pending_payment`,
-/// Razorpay, expiring after `payment_expiry`), its items and one
+/// Cashfree, expiring after `payment_expiry`), its items and one
 /// `order_placed` movement per line — all in ONE statement. The products must
 /// already be locked (see [`lock_products`]) and stock checked by the caller;
 /// the `stock >= 0` CHECK is the last line of defence.
@@ -848,7 +860,7 @@ pub async fn insert_order(
                 $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 (SELECT sum(unit_price * quantity) FROM lines)::bigint + $25,
                 CASE WHEN $23 THEN 'pending_payment' ELSE 'pending_pack' END,
-                CASE WHEN $23 THEN 'razorpay' ELSE 'pay_later' END,
+                CASE WHEN $23 THEN 'cashfree' ELSE 'pay_later' END,
                 'pending', $21,
                 CASE WHEN $23 THEN now() + make_interval(secs => $22) END,
                 $24, $25

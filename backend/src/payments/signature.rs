@@ -1,42 +1,58 @@
-//! Razorpay signature verification and identifier validation.
+//! Cashfree webhook signature verification and gateway id validation.
 //!
-//! * Checkout handler signature: hex `HMAC_SHA256(order_id + "|" + payment_id, key_secret)`.
-//! * Webhook signature (`X-Razorpay-Signature`): hex `HMAC_SHA256(raw_body, webhook_secret)`.
+//! * Webhook signature (`x-webhook-signature`): standard base64 of
+//!   `HMAC_SHA256(key = CASHFREE_SECRET_KEY, msg = x-webhook-timestamp ‖ raw_body)`
+//!   (plain concatenation, no separator; the timestamp is the header value as
+//!   sent, epoch milliseconds).
 //!
-//! Signatures are decoded strictly (exactly 64 hex digits) and compared in
-//! constant time. A valid checkout signature only proves the browser relayed
-//! values Razorpay produced; it is never by itself a reason to mark an order
-//! paid (the payment service always confirms with the Razorpay API).
+//! The signature is decoded strictly (exactly 44 characters of padded standard
+//! base64 encoding exactly 32 bytes; no whitespace, no URL-safe alphabet) and
+//! compared in constant time over the EXACT raw bytes received — never a
+//! re-serialised body. A valid signature only makes a delivery worth looking
+//! at: the payment service re-reads the authoritative state from the Cashfree
+//! API before changing anything, so a replayed (old but genuine) delivery can
+//! never move money or state on its own.
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Length of a hex-encoded SHA-256 MAC.
-pub const SIGNATURE_HEX_LEN: usize = 64;
+/// Length of a padded standard-base64 SHA-256 MAC.
+pub const SIGNATURE_B64_LEN: usize = 44;
+/// `x-webhook-timestamp`: 1-20 ASCII digits.
+const MAX_TIMESTAMP_DIGITS: usize = 20;
 
-/// `true` for `<prefix><6..=40 ASCII alphanumerics>`, e.g. `order_N3xYz12ABCdef`.
-fn is_prefixed_id(s: &str, prefix: &str) -> bool {
-    s.strip_prefix(prefix).is_some_and(|rest| {
-        (6..=40).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
-    })
+/// `[A-Za-z0-9_-]{min..=max}`.
+fn is_token(s: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Razorpay order id: `^order_[A-Za-z0-9]{6,40}$`.
-pub fn is_order_id(s: &str) -> bool {
-    is_prefixed_id(s, "order_")
+/// Any id we put in a Cashfree URL path or store in a gateway id column:
+/// `^[A-Za-z0-9_-]{1,64}$` (the DB checks of migration 000013).
+pub fn is_gateway_id(s: &str) -> bool {
+    is_token(s, 1, 64)
 }
 
-/// Razorpay payment id: `^pay_[A-Za-z0-9]{6,40}$`.
-pub fn is_payment_id(s: &str) -> bool {
-    is_prefixed_id(s, "pay_")
+/// Cashfree order id (ours, see `cashfree::gateway_order_id`):
+/// `^[A-Za-z0-9_-]{3,64}$` (Cashfree itself caps it at 45).
+pub fn is_gateway_order_id(s: &str) -> bool {
+    is_token(s, 3, 64)
 }
 
-/// Razorpay refund id: `^rfnd_[A-Za-z0-9]{6,40}$`.
-pub fn is_refund_id(s: &str) -> bool {
-    is_prefixed_id(s, "rfnd_")
+/// Cashfree `cf_payment_id` / `cf_refund_id`, stored as a string:
+/// `^[A-Za-z0-9_-]{1,64}$` (digits in practice).
+pub fn is_gateway_payment_id(s: &str) -> bool {
+    is_gateway_id(s)
+}
+
+/// See [`is_gateway_payment_id`].
+pub fn is_gateway_refund_id(s: &str) -> bool {
+    is_gateway_id(s)
 }
 
 /// Lowercase hex encoding.
@@ -50,27 +66,19 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Strictly decode a 64-digit hex signature into 32 bytes. Anything else
-/// (wrong length, whitespace, non-hex) is `None`.
+/// Strictly decode a base64 signature into 32 bytes. Anything else (wrong
+/// length, whitespace, missing padding, URL-safe alphabet, non-canonical
+/// trailing bits) is `None`.
 pub fn decode_signature(s: &str) -> Option<[u8; 32]> {
-    let bytes = s.as_bytes();
-    if bytes.len() != SIGNATURE_HEX_LEN {
+    if s.len() != SIGNATURE_B64_LEN {
         return None;
     }
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
-        out[i] = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
-    }
-    Some(out)
+    let bytes = STANDARD.decode(s).ok()?;
+    bytes.try_into().ok()
+}
+
+fn is_timestamp(ts: &str) -> bool {
+    (1..=MAX_TIMESTAMP_DIGITS).contains(&ts.len()) && ts.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -82,67 +90,41 @@ fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn ct_matches(expected: &[u8; 32], presented_hex: &str) -> bool {
-    match decode_signature(presented_hex) {
-        Some(presented) => presented.ct_eq(expected).into(),
-        None => false,
-    }
+/// Base64 signature Cashfree sends for `(timestamp, body)`.
+pub fn webhook_signature(secret_key: &[u8], timestamp: &str, body: &[u8]) -> String {
+    STANDARD.encode(hmac_sha256(secret_key, &[timestamp.as_bytes(), body]))
 }
 
-/// Hex signature Razorpay Checkout returns for `(order_id, payment_id)`.
-pub fn checkout_signature(key_secret: &[u8], order_id: &str, payment_id: &str) -> String {
-    hex_encode(&hmac_sha256(
-        key_secret,
-        &[order_id.as_bytes(), b"|", payment_id.as_bytes()],
-    ))
-}
-
-/// Verify the Checkout `razorpay_signature`. The ids must already be
-/// well-formed; malformed ids are rejected here as well.
-pub fn verify_checkout(
-    key_secret: &[u8],
-    order_id: &str,
-    payment_id: &str,
-    signature_hex: &str,
+/// Verify `x-webhook-signature` for `x-webhook-timestamp` over the exact raw
+/// request body. An empty secret never verifies anything.
+pub fn verify_webhook(
+    secret_key: &[u8],
+    timestamp: &str,
+    body: &[u8],
+    signature_b64: &str,
 ) -> bool {
-    if !is_order_id(order_id) || !is_payment_id(payment_id) {
+    if secret_key.is_empty() || !is_timestamp(timestamp) {
         return false;
     }
-    let expected = hmac_sha256(
-        key_secret,
-        &[order_id.as_bytes(), b"|", payment_id.as_bytes()],
-    );
-    ct_matches(&expected, signature_hex)
-}
-
-/// Hex signature of a webhook body.
-pub fn webhook_signature(webhook_secret: &[u8], body: &[u8]) -> String {
-    hex_encode(&hmac_sha256(webhook_secret, &[body]))
-}
-
-/// Verify `X-Razorpay-Signature` over the exact raw request body.
-pub fn verify_webhook(webhook_secret: &[u8], body: &[u8], signature_hex: &str) -> bool {
-    let expected = hmac_sha256(webhook_secret, &[body]);
-    ct_matches(&expected, signature_hex)
+    let Some(presented) = decode_signature(signature_b64) else {
+        return false;
+    };
+    let expected = hmac_sha256(secret_key, &[timestamp.as_bytes(), body]);
+    presented.ct_eq(&expected).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const KEY: &[u8] = b"test_key_secret_0123456789";
-    const OID: &str = "order_DBJOWzybf0sJbb";
-    const PID: &str = "pay_DESlfW9H8K9uqM";
+    const KEY: &[u8] = b"cfsk_ma_test_0123456789abcdef";
+    const TS: &str = "1760950000123";
 
     /// Independent computation with the hmac crate directly.
-    fn reference_hex(key: &[u8], msg: &[u8]) -> String {
+    fn reference_b64(key: &[u8], msg: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(key).unwrap_or_else(|_| unreachable!());
         mac.update(msg);
-        mac.finalize()
-            .into_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        STANDARD.encode(mac.finalize().into_bytes())
     }
 
     #[test]
@@ -156,88 +138,95 @@ mod tests {
     }
 
     #[test]
-    fn checkout_signature_roundtrip_and_tampering() {
-        let good = reference_hex(KEY, format!("{OID}|{PID}").as_bytes());
-        assert_eq!(checkout_signature(KEY, OID, PID), good);
-        assert!(verify_checkout(KEY, OID, PID, &good));
-        assert!(
-            verify_checkout(KEY, OID, PID, &good.to_ascii_uppercase()),
-            "hex is case-insensitive"
-        );
+    fn webhook_signature_roundtrip_and_tampering() {
+        let body =
+            br#"{"data":{"order":{"order_id":"ZM-1_abc"}},"type":"PAYMENT_SUCCESS_WEBHOOK"}"#;
+        let mut msg = TS.as_bytes().to_vec();
+        msg.extend_from_slice(body);
+        let good = reference_b64(KEY, &msg);
+        assert_eq!(good.len(), SIGNATURE_B64_LEN);
+        assert_eq!(webhook_signature(KEY, TS, body), good);
+        assert!(verify_webhook(KEY, TS, body, &good));
 
-        // Wrong key, swapped/changed ids.
-        assert!(!verify_checkout(
-            b"another_secret_0123456789",
-            OID,
-            PID,
+        // Body, timestamp or key changed.
+        let mut spaced = body.to_vec();
+        spaced.push(b' ');
+        assert!(!verify_webhook(KEY, TS, &spaced, &good));
+        assert!(!verify_webhook(KEY, "1760950000124", body, &good));
+        assert!(!verify_webhook(
+            b"cfsk_ma_test_another_secret",
+            TS,
+            body,
             &good
         ));
-        assert!(!verify_checkout(KEY, "order_DBJOWzybf0sJbc", PID, &good));
-        assert!(!verify_checkout(KEY, OID, "pay_DESlfW9H8K9uqN", &good));
-        // A signature over the concatenation without the separator must not verify.
-        let no_sep = reference_hex(KEY, format!("{OID}{PID}").as_bytes());
-        assert!(!verify_checkout(KEY, OID, PID, &no_sep));
-
-        // Flip one hex digit.
-        let mut flipped = good.clone().into_bytes();
-        flipped[10] = if flipped[10] == b'0' { b'1' } else { b'0' };
-        assert!(!verify_checkout(
-            KEY,
-            OID,
-            PID,
-            std::str::from_utf8(&flipped).unwrap_or_default()
-        ));
+        assert!(!verify_webhook(b"", TS, body, &reference_b64(b"", &msg)));
+        // A signature over the body alone (no timestamp) must not verify.
+        assert!(!verify_webhook(KEY, TS, body, &reference_b64(KEY, body)));
+        // With a separator ("ts.body") must not verify either.
+        let mut dotted = TS.as_bytes().to_vec();
+        dotted.push(b'.');
+        dotted.extend_from_slice(body);
+        assert!(!verify_webhook(KEY, TS, body, &reference_b64(KEY, &dotted)));
 
         // Strict decoding.
-        assert!(!verify_checkout(KEY, OID, PID, ""));
-        assert!(!verify_checkout(KEY, OID, PID, &good[..63]));
-        assert!(!verify_checkout(KEY, OID, PID, &format!("{good}0")));
-        assert!(!verify_checkout(KEY, OID, PID, &format!(" {}", &good[1..])));
-        assert!(!verify_checkout(KEY, OID, PID, &"g".repeat(64)));
+        assert!(!verify_webhook(KEY, TS, body, ""));
+        assert!(!verify_webhook(KEY, TS, body, &good[..43]));
+        assert!(!verify_webhook(KEY, TS, body, &format!("{good}=")));
+        assert!(!verify_webhook(KEY, TS, body, &format!(" {}", &good[1..])));
+        assert!(!verify_webhook(KEY, TS, body, &"A".repeat(44)));
+        // Hex (Razorpay style) is not accepted.
+        assert!(!verify_webhook(KEY, TS, body, &hex_encode(&[0u8; 32])));
 
-        // Malformed ids never verify, even with a matching MAC.
-        let bad_ids = reference_hex(KEY, b"order_x|pay_y");
-        assert!(!verify_checkout(KEY, "order_x", "pay_y", &bad_ids));
+        // Malformed timestamps.
+        for ts in ["", "17609x0000123", " 1760950000123", "-1", &"9".repeat(21)] {
+            assert!(
+                !verify_webhook(KEY, ts, body, &webhook_signature(KEY, ts, body)),
+                "{ts:?}"
+            );
+        }
     }
 
     #[test]
-    fn webhook_signature_roundtrip_and_tampering() {
-        let secret = b"test_webhook_secret_0123456789";
-        let body = br#"{"event":"payment.captured","payload":{}}"#;
-        let good = reference_hex(secret, body);
-        assert_eq!(webhook_signature(secret, body), good);
-        assert!(verify_webhook(secret, body, &good));
-        assert!(!verify_webhook(
-            secret,
-            br#"{"event":"payment.captured","payload":{} }"#,
-            &good
-        ));
-        assert!(!verify_webhook(b"test_key_secret_0123456789", body, &good));
-        assert!(!verify_webhook(secret, body, ""));
-        assert!(!verify_webhook(secret, body, "zz"));
+    fn decode_is_strict() {
+        let sig = STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_signature(&sig), Some([7u8; 32]));
+        assert_eq!(decode_signature(&STANDARD.encode([7u8; 31])), None);
+        assert_eq!(decode_signature(&sig.replace('=', "A")), None);
+        // URL-safe alphabet is not standard base64.
+        let std_sig = STANDARD.encode([0xfbu8; 32]);
+        assert!(std_sig.contains('+') || std_sig.contains('/'));
+        assert_eq!(decode_signature(&std_sig), Some([0xfbu8; 32]));
+        let url_safe = base64::engine::general_purpose::URL_SAFE.encode([0xfbu8; 32]);
+        assert_eq!(decode_signature(&url_safe), None);
+        // Non-canonical final symbol (trailing bits set) is rejected.
+        // `[7; 32]` encodes to "...Bwc=": the last symbol carries 2 unused bits.
+        let mut bad = sig.into_bytes();
+        bad[42] = b'x';
+        let bad = String::from_utf8(bad).unwrap_or_default();
+        assert_eq!(decode_signature(&bad), None);
     }
 
     #[test]
     fn id_formats() {
-        assert!(is_order_id(OID));
-        assert!(is_payment_id(PID));
-        assert!(is_refund_id("rfnd_FP8QHiV938haTz"));
-        assert!(!is_order_id("order_"));
-        assert!(!is_order_id("order_abc12"));
-        assert!(!is_order_id(&format!("order_{}", "a".repeat(41))));
-        assert!(is_order_id(&format!("order_{}", "a".repeat(40))));
-        assert!(!is_order_id("order_abc-123"));
-        assert!(!is_order_id("order_abc123\n"));
-        assert!(!is_order_id(PID));
-        assert!(!is_payment_id(OID));
-        assert!(!is_payment_id("pay_ünicode1"));
-        assert!(!is_refund_id("rfnd_ab"));
+        assert!(is_gateway_order_id("ZM-261020-1001_8f3a2b1c9d0e"));
+        assert!(
+            is_gateway_order_id("order_DBJOWzybf0sJbb"),
+            "legacy Razorpay ids still valid"
+        );
+        assert!(!is_gateway_order_id("ab"));
+        assert!(!is_gateway_order_id(&"a".repeat(65)));
+        assert!(is_gateway_order_id(&"a".repeat(64)));
+        assert!(!is_gateway_order_id("ZM-1/../../x"));
+        assert!(!is_gateway_order_id("ZM-1 1"));
+        assert!(!is_gateway_order_id("ZM-1\n"));
+        assert!(is_gateway_payment_id("5114910253538"));
+        assert!(is_gateway_refund_id("11325632"));
+        assert!(!is_gateway_payment_id(""));
+        assert!(!is_gateway_payment_id("ünicode"));
     }
 
     #[test]
-    fn hex_roundtrip() {
-        let bytes: Vec<u8> = (0u8..32).collect();
-        let hex = hex_encode(&bytes);
-        assert_eq!(decode_signature(&hex).map(|a| a.to_vec()), Some(bytes));
+    fn hex_encoding() {
+        assert_eq!(hex_encode(&[0x00, 0xab, 0xff]), "00abff");
     }
 }

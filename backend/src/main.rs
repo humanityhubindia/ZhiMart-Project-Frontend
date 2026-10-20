@@ -114,23 +114,30 @@ async fn serve() -> anyhow::Result<()> {
              Orders are flagged isTest and excluded from revenue."
         );
     }
+    let legacy = zhimart_backend::config::legacy_razorpay_vars();
+    if !legacy.is_empty() {
+        tracing::warn!(
+            vars = %legacy.join(","),
+            "RAZORPAY_* settings are ignored: online payments now use Cashfree (CASHFREE_*); remove them"
+        );
+    }
     if !config.payments_enabled {
         tracing::info!(
             online_payments = false,
-            "RAZORPAY_ENABLED=false: orders are pay-later; admins record payments manually"
+            "CASHFREE_ENABLED=false: orders are pay-later; admins record payments manually"
         );
-    } else if config.razorpay_is_test_key() {
+    } else if config.cashfree_is_sandbox() {
         tracing::info!(
             online_payments = true,
-            razorpay_key_mode = "test",
-            "Razorpay online payments enabled with TEST keys: no real money moves"
+            cashfree_env = "sandbox",
+            "Cashfree online payments enabled against the SANDBOX: no real money moves"
         );
     } else {
         tracing::warn!(
             online_payments = true,
-            razorpay_key_mode = "live",
+            cashfree_env = "production",
             test_mode = config.payment_test_mode,
-            "Razorpay online payments enabled with LIVE keys: payments are real"
+            "Cashfree online payments enabled in PRODUCTION: payments are real"
         );
     }
     if !config.order_notifications_enabled {

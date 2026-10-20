@@ -36,13 +36,20 @@ pub const SESSION_BURST: u32 = 20;
 /// Public order placement: a real customer places one order, maybe retries once.
 pub const ORDERS_PER_MINUTE: u32 = 6;
 pub const ORDERS_BURST: u32 = 3;
-/// Guest payment endpoints (storefront config, pay, verify, order status).
+/// Guest payment endpoints (storefront config, pay, order status).
 /// The order status page polls `GET /orders/{n}` every ~3 s (20/min) for a
-/// couple of minutes after checkout, plus pay/verify; 40/min leaves room for
-/// a second tab. Every call also needs a valid per-order token.
+/// couple of minutes after checkout, plus pay; 40/min leaves room for a
+/// second tab. Every call also needs a valid per-order token.
 pub const PAYMENTS_PER_MINUTE: u32 = 40;
 pub const PAYMENTS_BURST: u32 = 15;
-/// Razorpay webhooks are authenticated by HMAC, not by IP, and arrive in
+/// `POST /orders/{n}/pay/verify` has its own budget: while a payment is
+/// pending the storefront polls it every ~5 s (12/min) for up to 2 minutes,
+/// independently of the status polling above. 30/min with a burst of 10 fits
+/// two tabs (or two customers behind one carrier-grade NAT address) polling
+/// at once. Each call costs one Cashfree API read, so it stays bounded.
+pub const VERIFY_PER_MINUTE: u32 = 30;
+pub const VERIFY_BURST: u32 = 10;
+/// Cashfree webhooks are authenticated by HMAC, not by IP, and arrive in
 /// bursts from a few gateway IPs. This is only a safety valve against a
 /// flood of unsigned junk from one address, far above legitimate volume.
 pub const WEBHOOKS_PER_MINUTE: u32 = 600;
@@ -121,9 +128,11 @@ pub struct RateLimiters {
     /// Public checkout (`POST /orders`): placing an order reserves stock, so
     /// this is deliberately tight.
     pub orders: Arc<IpRateLimiter>,
-    /// Guest payment endpoints (`/storefront/config`, `/orders/{n}[/pay[/verify]]`).
+    /// Guest payment endpoints (`/storefront/config`, `/orders/{n}[/pay]`).
     pub payments: Arc<IpRateLimiter>,
-    /// `POST /webhooks/razorpay` only (it is outside the global /api limiter).
+    /// `POST /orders/{n}/pay/verify` (polled while a payment is pending).
+    pub payment_verify: Arc<IpRateLimiter>,
+    /// `POST /webhooks/cashfree` only (it is outside the global /api limiter).
     pub webhooks: Arc<IpRateLimiter>,
 }
 
@@ -157,6 +166,10 @@ impl RateLimiters {
                 "payments",
                 per_minute(PAYMENTS_PER_MINUTE, PAYMENTS_BURST),
             )),
+            payment_verify: Arc::new(IpRateLimiter::new(
+                "payment_verify",
+                per_minute(VERIFY_PER_MINUTE, VERIFY_BURST),
+            )),
             webhooks: Arc::new(IpRateLimiter::new(
                 "webhooks",
                 per_minute(WEBHOOKS_PER_MINUTE, WEBHOOKS_BURST),
@@ -164,13 +177,14 @@ impl RateLimiters {
         }
     }
 
-    pub fn all(&self) -> [&Arc<IpRateLimiter>; 6] {
+    pub fn all(&self) -> [&Arc<IpRateLimiter>; 7] {
         [
             &self.global,
             &self.credentials,
             &self.session,
             &self.orders,
             &self.payments,
+            &self.payment_verify,
             &self.webhooks,
         ]
     }
@@ -351,6 +365,27 @@ mod tests {
         clock.advance(Duration::from_secs(120));
         assert_eq!(l.gc(), 0);
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn verify_polling_fits_the_budget() {
+        // Two tabs polling every 5 s for 2 minutes, plus the initial call each.
+        let clock = FakeRelativeClock::default();
+        let l = IpRateLimiter::with_clock(
+            "v",
+            per_minute(VERIFY_PER_MINUTE, VERIFY_BURST),
+            clock.clone(),
+        );
+        let a = ip("198.51.100.9");
+        for _ in 0..24 {
+            assert!(l.check(a).is_ok(), "tab 1");
+            assert!(l.check(a).is_ok(), "tab 2");
+            clock.advance(Duration::from_secs(5));
+        }
+        // A tight loop is still cut off.
+        let b = ip("198.51.100.10");
+        let allowed = (0..100).filter(|_| l.check(b).is_ok()).count();
+        assert_eq!(allowed, VERIFY_BURST as usize);
     }
 
     #[test]

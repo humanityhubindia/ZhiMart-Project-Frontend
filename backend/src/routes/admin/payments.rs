@@ -1,4 +1,4 @@
-//! Admin payment operations: Razorpay refunds and the payment event log.
+//! Admin payment operations: Cashfree refunds and the payment event log.
 
 use axum::{
     Json, Router,
@@ -18,7 +18,7 @@ use crate::{
     payments::service::{self, RefundJob},
     repo::{
         self, audit,
-        orders::{METHOD_RAZORPAY, Order, OrderRef},
+        orders::{METHOD_CASHFREE, METHOD_RAZORPAY_LEGACY, Order, OrderRef},
         payments::NewRefund,
     },
     routes::{json::ApiJson, payments::ONLINE_PAYMENTS_DISABLED},
@@ -28,7 +28,7 @@ use crate::{
 const MAX_REASON_CHARS: usize = 300;
 const MAX_EVENTS: i64 = 200;
 
-/// POST /orders/{id}/refund (Razorpay refund), GET /orders/{id}/payment-events.
+/// POST /orders/{id}/refund (Cashfree refund), GET /orders/{id}/payment-events.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/orders/{id}/refund", post(refund))
@@ -65,7 +65,11 @@ const VERSION_CONFLICT: AppError = AppError::Conflict {
 };
 const NOT_REFUNDABLE: AppError = AppError::Conflict {
     code: "invalid_transition",
-    message: "This order has no Razorpay payment left to refund.",
+    message: "This order has no online payment left to refund.",
+};
+const LEGACY_RAZORPAY: AppError = AppError::Conflict {
+    code: "invalid_transition",
+    message: "This order was paid through Razorpay; refund it from the Razorpay Dashboard.",
 };
 const EXCEEDS_REMAINING: AppError = AppError::Conflict {
     code: "refund_exceeds_remaining",
@@ -100,7 +104,7 @@ async fn refund(
 
     // Resolve earlier refunds whose outcome was never confirmed, so their
     // reservation is released (or recorded) before computing what is left.
-    // (Skipped while online payments are disabled: no Razorpay calls then.)
+    // (Skipped while online payments are disabled: no Cashfree calls then.)
     if state.config.payments_enabled
         && let Some(current) = repo::orders::find(&state.db, &order_ref).await?
     {
@@ -115,14 +119,21 @@ async fn refund(
     if order.version != body.expected_version {
         return Err(VERSION_CONFLICT);
     }
-    let Some(payment_id) = order.razorpay_payment_id.clone() else {
+    if order.payment_method == METHOD_RAZORPAY_LEGACY && order.gateway_payment_id.is_some() {
+        // Paid before the switch to Cashfree: Cashfree cannot refund it.
+        return Err(LEGACY_RAZORPAY);
+    }
+    let (Some(payment_id), Some(gateway_order_id)) = (
+        order.gateway_payment_id.clone(),
+        order.gateway_order_id.clone(),
+    ) else {
         return Err(NOT_REFUNDABLE);
     };
-    if order.payment_method != METHOD_RAZORPAY || order.payment_status != "paid" {
+    if order.payment_method != METHOD_CASHFREE || order.payment_status != "paid" {
         return Err(NOT_REFUNDABLE);
     }
-    // A Razorpay-paid order from before payments were switched off: the
-    // gateway may not be configured, so refund it from the Razorpay Dashboard.
+    // A Cashfree-paid order from before payments were switched off: the
+    // gateway may not be configured, so refund it from the Cashfree dashboard.
     if !state.config.payments_enabled {
         return Err(ONLINE_PAYMENTS_DISABLED);
     }
@@ -142,7 +153,7 @@ async fn refund(
         &NewRefund {
             id: refund_id,
             order_id: order.id,
-            razorpay_payment_id: &payment_id,
+            gateway_payment_id: &payment_id,
             amount_paise: amount,
             reason,
             initiated_by: Some(admin.admin_id),
@@ -169,6 +180,7 @@ async fn refund(
         refund_id,
         order_id: order.id,
         order_number: order.order_number.clone(),
+        gateway_order_id,
         payment_id,
         amount_paise: amount,
     };
@@ -200,8 +212,8 @@ struct EventView {
 #[serde(rename_all = "camelCase")]
 struct RefundView {
     id: Uuid,
-    razorpay_refund_id: Option<String>,
-    razorpay_payment_id: String,
+    gateway_refund_id: Option<String>,
+    gateway_payment_id: String,
     #[serde(serialize_with = "serialize_rupees")]
     amount: i64,
     status: String,
@@ -243,8 +255,8 @@ async fn payment_events(
             .into_iter()
             .map(|r| RefundView {
                 id: r.id,
-                razorpay_refund_id: r.razorpay_refund_id,
-                razorpay_payment_id: r.razorpay_payment_id,
+                gateway_refund_id: r.gateway_refund_id,
+                gateway_payment_id: r.gateway_payment_id,
                 amount: r.amount_paise,
                 status: r.status,
                 reason: r.reason,

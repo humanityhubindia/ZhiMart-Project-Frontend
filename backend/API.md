@@ -185,7 +185,7 @@ Also decided server-side, after tier pricing:
 - `subtotal < pricing.freeDeliveryMin` (default ₹5,000) ⇒ `deliveryFee = pricing.deliveryFee`
   (default ₹500); `subtotal >= freeDeliveryMin` (inclusive) ⇒ `deliveryFee = 0`.
   `freeDeliveryMin` 0 ⇒ delivery is always free.
-- `totalAmount = subtotal + deliveryFee` is the payable amount: it is what Razorpay is asked
+- `totalAmount = subtotal + deliveryFee` is the payable amount: it is what Cashfree is asked
   for, what verification checks, what refunds are capped at, and what dashboard revenue counts.
   GST: prices are tax-inclusive, no tax is added (emails show "Tax (GST): ₹0").
 - `PAYMENT_TEST_MODE`: the fee is ₹1 (published as `deliveryFee: 1`), applied when the ₹1-per-unit
@@ -325,56 +325,75 @@ Dashboard
 
 ---
 
-# Payments (Razorpay) & Guest Orders (v1)
+# Payments (Cashfree) & Guest Orders (v1)
 
 Customers never log in. Checkout collects only: name, phone, email, address, city,
-pincode, optional state (default "Tamil Nadu"), optional notes. Payment is online via Razorpay Checkout.
+pincode, optional state (default "Tamil Nadu"), optional notes. Payment is online via
+Cashfree Payments (JS SDK v3 checkout; Cashfree PG API version `2023-08-01`).
 
-**Trust model:** the browser never decides that an order is paid. An order becomes paid only
-after the server (a) verifies the Checkout signature AND confirms the payment with the
-Razorpay API (amount, currency, order id, status), or (b) receives a signature-verified
-webhook. Both paths run the same idempotent service.
+**Trust model:** the browser never decides that an order is paid, and neither does a
+webhook payload. An order becomes paid only after the server reads the order's payments
+from the Cashfree API (`GET /orders/{cfOrderId}/payments`) and finds one with status
+`SUCCESS`, the same Cashfree order id, currency `INR` and amount exactly `totalAmount`.
+`/pay/verify`, the signed webhook and the expiry sweep all just trigger that re-read and
+run the same idempotent service (one transition per order, under its row lock).
 
 ## Order lifecycle
 ```
 POST /orders ─► pending_payment (stock RESERVED, paymentExpiresAt = now + PAYMENT_EXPIRY_MINUTES)
-      │  POST /orders/{n}/pay ─► Razorpay order created (once) ─► Checkout modal
-      │  verified payment (verify endpoint or webhook)
+      │  POST /orders/{n}/pay ─► Cashfree order created (once; deterministic id) ─► paymentSessionId
+      │  storefront: Cashfree({mode}).checkout({paymentSessionId, redirectTarget: "_modal"})
+      │  POST /orders/{n}/pay/verify (polled while PENDING) / webhook / expiry sweep
+      │      ─► API shows SUCCESS
       ▼
  pending_pack ─► dispatched ─► in_transit ─► out_for_delivery ─► delivered
- pending_payment past expiry ─► cancelled (stock released, cancel_reason "Payment not completed")
+ pending_payment past expiry ─► (Cashfree asked first) ─► cancelled (stock released, cancel_reason "Payment not completed")
  payment arrives after expiry ─► stock re-reserved if available ("revived"), else auto-refund
 ```
+
+Cashfree order id (`gatewayOrderId`): `{orderNumber}_{last 12 hex digits of the order UUID}`,
+e.g. `ZM-261020-1001_8f3a2b1c9d0e` — the same for every attempt on one order.
 
 ## Test mode
 `PAYMENT_TEST_MODE=true` ⇒ every product is **charged ₹1 per unit**, enforced server-side:
 public catalog `price` = 1 (real `originalPrice` kept), `GET /products` returns
 `{ "products": [...], "testMode": true }`, orders are created with `isTest: true` and totals at
 ₹1 × quantity (+ a ₹1 delivery charge below `freeDeliveryMin`; `pricing.deliveryFee` is 1). `false` ⇒ real prices (production). With `APP_ENV=production` and test mode off,
-live keys (`rzp_live_…`) are required. Test orders are excluded from real revenue figures.
+`CASHFREE_ENV=production` (live credentials) is required. Test orders are excluded from real revenue figures.
 
 ## Guest order token
 `POST /orders` returns `orderToken` (43-char base64url, HMAC-derived, bound to the order).
 It authorizes pay/verify/status for that order only. Send it as header **`X-Order-Token`**
 (never in a query string). The storefront keeps it in the URL **fragment**
-(`?page=order&order=ZM-…#t=<token>`) so it never reaches server logs or `Referer`.
+(`?page=order&order=ZM-…#t=<token>`) so it never reaches server logs or `Referer`. The
+Cashfree `return_url` (`{PUBLIC_SITE_URL}/?page=order&order=ZM-…&cf_return=1`) never contains
+it; for redirect flows the storefront keeps it in `sessionStorage` (`zm_order_token:{orderNumber}`).
 Wrong/missing token ⇒ 404 `not_found` (indistinguishable from an unknown order).
 
-## New error codes
+## Error codes
 | HTTP | code                          | meaning                                                   |
 |------|-------------------------------|-----------------------------------------------------------|
-| 409  | `order_already_paid`          | pay/verify on a paid order (verify is idempotent → 200)   |
-| 409  | `order_expired`               | payment window closed; order cancelled, stock released    |
-| 409  | `order_not_payable`           | order cancelled for another reason                        |
-| 400  | `payment_verification_failed` | signature/amount/order mismatch — treat as unpaid         |
-| 502  | `payment_gateway_error`       | Razorpay API failed/timed out — retry                     |
+| 409  | `order_already_paid`          | pay on a paid order (verify is idempotent → 200)          |
+| 409  | `order_expired`               | payment window closed; order cancelled, stock released (also: late payment refunded) |
+| 409  | `order_not_payable`           | order cancelled for another reason / not an online order  |
+| 409  | `payment_pending`             | verify: a payment is still `PENDING` at Cashfree — poll again in ~5 s |
+| 400  | `payment_not_completed`       | verify: no successful (or pending) payment — the customer may try again |
+| 400  | `payment_verification_failed` | verify: a successful payment does not match the order (amount/currency/order) — never paid; flagged for the admins |
+| 502  | `payment_gateway_error`       | Cashfree API failed/timed out (or answered inconsistently) — retry |
+| 409  | `online_payments_disabled`    | `CASHFREE_ENABLED=false`                                  |
 | 409  | `refund_exceeds_remaining`    | refund amount larger than what is left to refund          |
 
 ## Public endpoints
 
 ### `GET /storefront/config`
-`{ "testMode": false, "onlinePaymentsEnabled": true, "razorpayKeyId": "rzp_live_…", "currency": "INR", "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks", "pricing": { "bulkMinOrder": 5000, "bulkDiscountPercent": 85, "standardDiscountPercent": 80, "deliveryFee": 500, "freeDeliveryMin": 5000 } }`
-(`Cache-Control: public, max-age=60`). The key id is public by design; the secret never leaves the server.
+```json
+{ "testMode": false, "onlinePaymentsEnabled": true, "paymentGateway": "cashfree", "cashfreeMode": "production",
+  "currency": "INR", "paymentExpiryMinutes": 30, "storeName": "Zhi-Mart Fireworks",
+  "pricing": { "bulkMinOrder": 5000, "bulkDiscountPercent": 85, "standardDiscountPercent": 80, "deliveryFee": 500, "freeDeliveryMin": 5000 } }
+```
+`paymentGateway` is `"cashfree"` or `null`; `cashfreeMode` (the JS SDK `mode`) is `"sandbox"` |
+`"production"` or `null`; both are `null` when online payments are disabled. No key or secret is
+ever exposed. `Cache-Control: public, max-age=60`. (Replaces the former `razorpayKeyId`.)
 
 ### `POST /orders` (changed)
 Request unchanged. 201 (replay 200, same values):
@@ -389,28 +408,41 @@ Request unchanged. 201 (replay 200, same values):
 ```
 
 ### `POST /orders/{orderNumber}/pay`  (header `X-Order-Token`)
-Creates the Razorpay order on first call (`amount = totalAmount in paise`, delivery included, `currency INR`,
-`receipt = orderNumber`, `notes.order_id`), reuses it afterwards (Razorpay allows multiple
-attempts per order). 200:
+Creates the Cashfree order on the first call (`order_amount = totalAmount` in rupees, delivery
+included, `INR`, customer id/phone/email/name, `return_url`, optional `notify_url`,
+`order_expiry_time` ≥ `paymentExpiresAt` and at least 16 min ahead, tags `order_number`/`order_uuid`),
+then fetches it on later calls (same deterministic id, so double clicks, two tabs and lost
+responses — Cashfree's 409 "order already exists" — converge on one Cashfree order). The Cashfree
+order is checked (id, amount, currency) before its session is handed out. 200 (`no-store`):
 ```json
 {
-  "keyId": "rzp_live_…", "razorpayOrderId": "order_…", "amountPaise": 200000, "currency": "INR",
-  "name": "Zhi-Mart Fireworks", "description": "Order ZM-261013-1001",
-  "prefill": { "name": "…", "email": "…|null", "contact": "+919840012345" },
-  "notes": { "orderNumber": "ZM-261013-1001" },
-  "paymentExpiresAt": "…", "testMode": false
+  "gateway": "cashfree",
+  "paymentSessionId": "session_…",
+  "gatewayOrderId": "ZM-261020-1001_8f3a2b1c9d0e",
+  "amountPaise": 215000,
+  "currency": "INR",
+  "mode": "sandbox|production",
+  "paymentExpiresAt": "…",
+  "testMode": false
 }
 ```
-Errors: 404, 409 `order_already_paid` / `order_expired` / `order_not_payable`, 502 `payment_gateway_error`.
+If the Cashfree order is already `PAID` (the customer paid, verify not yet called), the payment is
+settled first and the answer is 409 `order_already_paid` (or `order_expired` / `order_not_payable`
+when it was a late payment that had to be refunded).
+Errors: 404, 409 `order_already_paid` / `order_expired` / `order_not_payable` / `online_payments_disabled`,
+502 `payment_gateway_error`.
 
 ### `POST /orders/{orderNumber}/pay/verify`  (header `X-Order-Token`)
-Body (from Checkout's `handler`): `{ "razorpayOrderId": "order_…", "razorpayPaymentId": "pay_…", "razorpaySignature": "<hex>" }`
-Server: constant-time `HMAC_SHA256(razorpayOrderId + "|" + razorpayPaymentId, KEY_SECRET)`;
-order id must equal the order's stored Razorpay order; then `GET /v1/payments/{id}` must show
-the same `order_id`, `amount == total`, `currency INR`, status `captured` (an `authorized`
-payment is captured via the API). Marks the order paid → `pending_pack`. Idempotent.
-200 `GuestOrder`. Errors: 400 `payment_verification_failed`, 404, 409 `order_expired`
-(late payment refunded), 502.
+Body: `{}` (an empty body is accepted too; any field is a 400 `validation_error` — the client has
+nothing to claim). The server reads `GET /orders/{gatewayOrderId}/payments` from Cashfree and settles
+a `SUCCESS` payment whose order id, currency and amount match. Idempotent and cheap once paid (no
+Cashfree call); safe to poll every ~5 s (own rate limit: 30/min, burst 10).
+- 200 `GuestOrder` — paid now or already paid (`payment.status = "paid"`, `status = "pending_pack"`).
+- 409 `payment_pending` — a payment is `PENDING` (e.g. UPI collect awaiting approval): poll again.
+- 400 `payment_not_completed` — no successful or pending payment (closed checkout, declined, dropped).
+- 400 `payment_verification_failed` — a successful payment that does not match the order.
+- 409 `order_expired` (window closed and nothing paid, or a late payment that was refunded),
+  409 `order_not_payable`, 409 `online_payments_disabled`, 404, 502 `payment_gateway_error`.
 
 ### `GET /orders/{orderNumber}`  (header `X-Order-Token`)
 200 `GuestOrder` (minimal PII):
@@ -418,30 +450,52 @@ payment is captured via the API). Marks the order paid → `pending_pack`. Idemp
 { "orderNumber": "…", "status": "pending_payment|pending_pack|…|cancelled", "isTest": false,
   "pricingTier": "bulk|standard",
   "createdAt": "…", "paymentExpiresAt": "…|null",
-  "payment": { "status": "pending|paid|refunded|failed", "instrument": "upi|card|…|null", "paidAt": "…|null" },
+  "payment": { "method": "cashfree|pay_later|upi|…|razorpay (legacy)", "status": "pending|paid|refunded|failed",
+               "instrument": "upi|card|netbanking|wallet|emi|paylater|bank_transfer|null", "paidAt": "…|null" },
   "subtotal": 1650, "deliveryFee": 500, "totalAmount": 2150, "mrpTotal": 3000, "itemCount": 10, "items": [ … ],
   "shipping": { "transportPartner": null, "docketNumber": null, "dispatchedAt": null, "deliveredAt": null },
   "customerName": "…", "city": "…" }
 ```
+`payment.method` is `cashfree` for new online orders (`razorpay` only on orders paid before the
+switch). `instrument` maps Cashfree's `payment_group`: credit/debit/prepaid card → `card`, any EMI →
+`emi`, `net_banking` → `netbanking`, `pay_later` → `paylater`, `upi`, `wallet`, `bank_transfer`.
 
-### `POST /webhooks/razorpay`
-Configure in the Razorpay Dashboard → Webhooks with secret `RAZORPAY_WEBHOOK_SECRET` and
-events `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`,
-`refund.processed`, `refund.failed`. Verified with `X-Razorpay-Signature` = hex
-`HMAC_SHA256(raw body, webhook secret)` (constant-time). Deduplicated by `X-Razorpay-Event-Id`
-(`payment_events` primary key). Invalid signature ⇒ 400; 200 `{"status":"ok"}` once processed;
-5xx on a transient failure (DB or Razorpay down) so Razorpay redelivers — an event is only treated as a
-duplicate after it was processed successfully. Stored payloads are redacted (ids, amounts, statuses only). Not rate-limited per IP (signature
-is the authentication); body ≤ 64 KiB.
+### `POST /webhooks/cashfree`
+Configure in the Cashfree Merchant Dashboard → Developers → Webhooks: URL
+`https://api.zhimart.in/api/v1/webhooks/cashfree`, webhook version `2023-08-01`, payment events
+(success, failed, user dropped) and refund events (refund status, auto-refund status).
+- Verified with `x-webhook-signature` = base64 `HMAC_SHA256(CASHFREE_SECRET_KEY, x-webhook-timestamp + raw body)`
+  over the exact raw bytes, constant-time, strict decoding. Missing/invalid ⇒ 400 `validation_error`.
+- Deduplicated by `cf_` + sha256(raw body) (`payment_events` primary key): Cashfree re-signs
+  redeliveries with a new timestamp but the same body.
+- Handled types: `PAYMENT_SUCCESS_WEBHOOK` (re-reads the order's payments and settles),
+  `PAYMENT_FAILED_WEBHOOK` / `PAYMENT_USER_DROPPED_WEBHOOK` (recorded; the order stays payable),
+  `REFUND_STATUS_WEBHOOK` / `AUTO_REFUND_STATUS_WEBHOOK` (re-reads the refund, updates the ledger;
+  dashboard and automatic refunds are recorded too). Others are acknowledged and ignored.
+- 200 `{"status":"ok"}` once processed; 5xx on a transient failure (DB or Cashfree down, or a success
+  the API does not show yet) so Cashfree redelivers — an event is only treated as a duplicate after it
+  was processed successfully. 404 `not_found` when `CASHFREE_ENABLED=false`.
+- Stored payloads are redacted (ids, amounts, statuses, error codes only). Not rate-limited per IP
+  (the signature is the authentication; 600/min safety valve); body ≤ 64 KiB.
 
 ## Admin additions
-- `Order` gains `isTest`, `paymentExpiresAt`, and `payment.{instrument, razorpayOrderId, razorpayPaymentId, amountRefunded, attention}`; `status` may be `pending_payment`.
+- `Order` gains `isTest`, `paymentExpiresAt`, and `payment.{instrument, gatewayOrderId, gatewayPaymentId, amountRefunded, attention}`
+  (`gatewayOrderId` = Cashfree order id, `gatewayPaymentId` = Cashfree `cf_payment_id` as a digit string;
+  legacy Razorpay ids on orders paid before the switch). Formerly `razorpayOrderId` / `razorpayPaymentId`.
+  `status` may be `pending_payment`. `payment.method` may be `cashfree` (or legacy `razorpay`).
 - `GET /admin/orders` excludes `pending_payment` orders unless `status=pending_payment` or `includeUnpaid=true`.
 - `pending_payment` orders cannot be advanced via `/status` (409 `invalid_transition`); they may be cancelled (stock released).
-- Manual `/payment` actions are rejected (409 `invalid_transition`) for `payment.method = "razorpay"`; use refunds.
+- Manual `/payment` actions are rejected (409 `invalid_transition`) for online methods (`cashfree`, legacy `razorpay`); use refunds.
 - `POST /admin/orders/{id}/refund` `{ "amount": 1650 | null (full remaining, delivery charge included), "reason": "…", "expectedVersion": 3 }`
-  → Razorpay refund API (idempotent per request) → 200 `Order` (`payment.status = "refunded"` once fully refunded; partial refunds tracked in `amountRefunded`). Errors: 409 `invalid_transition` (not paid / nothing left), 502.
-- `GET /admin/orders/{id}/payment-events` → `{ "events": [{ "id","event","outcome","receivedAt" }], "refunds": [{ "id","razorpayRefundId","amount","status","reason","adminEmail","createdAt" }] }`
+  → Cashfree refund API (`POST /orders/{gatewayOrderId}/refunds`; our ledger row id is the `refund_id` and the
+  idempotency key, so a refund is never sent twice) → 200 `Order` (`payment.status = "refunded"` once fully
+  refunded; partial refunds tracked in `amountRefunded`, pending refunds count once Cashfree accepted them).
+  Unconfirmed earlier refunds are reconciled first (which can bump the version ⇒ 409 `version_conflict`).
+  Errors: 409 `invalid_transition` (not paid / nothing left / legacy Razorpay order: "refund it from the
+  Razorpay Dashboard"), 409 `refund_exceeds_remaining`, 409 `online_payments_disabled`, 502.
+- `GET /admin/orders/{id}/payment-events` → `{ "events": [{ "id","event","outcome","receivedAt" }], "refunds": [{ "id","gatewayRefundId","gatewayPaymentId","amount","status","reason","failureReason","adminEmail","createdAt" }] }`
+  (`gatewayRefundId` = Cashfree `cf_refund_id`; formerly `razorpayRefundId` / `razorpayPaymentId`; `event` is the
+  Cashfree webhook `type`).
 - Dashboard: real revenue excludes `isTest` orders and unpaid (`pending_payment`) orders; adds
   `"test": { "orders": n, "revenue": x }` and `"unpaid": { "orders": n, "amount": x }`.
 
@@ -449,19 +503,19 @@ is the authentication); body ≤ 64 KiB.
 
 # Payment switch & admin order notifications (v1)
 
-## `RAZORPAY_ENABLED` (default `false`)
-| | `RAZORPAY_ENABLED=false` (launch default) | `RAZORPAY_ENABLED=true` |
+## `CASHFREE_ENABLED` (default `false`)
+| | `CASHFREE_ENABLED=false` (launch default) | `CASHFREE_ENABLED=true` |
 |---|---|---|
 | `POST /orders` creates | `status: "pending_pack"`, `payment: {method: "pay_later", status: "pending"}`, `paymentExpiresAt: null` | `status: "pending_payment"` + 30-min payment window (see Payments section) |
 | Stock | deducted immediately, held until the admin cancels | reserved; released if unpaid at expiry |
-| `POST /orders/{n}/pay`, `/pay/verify` | 409 `online_payments_disabled` | Razorpay flow |
-| `POST /webhooks/razorpay` | 404 `not_found` | signature-verified processing |
+| `POST /orders/{n}/pay`, `/pay/verify` | 409 `online_payments_disabled` | Cashfree flow |
+| `POST /webhooks/cashfree` | 404 `not_found` | signature-verified processing |
 | Payment collection | admin records it manually (`POST /admin/orders/{id}/payment` `mark_paid` with method + reference) | automatic |
 | Admin notification email | queued when the order is **placed** | queued when the payment is **confirmed** (abandoned checkouts never email) |
-| Razorpay keys | optional | required (validated at startup) |
-| Admin Razorpay refund (`POST /admin/orders/{id}/refund`) | 409 `online_payments_disabled` for orders paid online before the switch — refund those from the Razorpay Dashboard; Razorpay is never called while disabled | Razorpay refund API |
+| Cashfree keys (`CASHFREE_APP_ID`, `CASHFREE_SECRET_KEY`) | optional | required (validated at startup) |
+| Admin refund (`POST /admin/orders/{id}/refund`) | 409 `online_payments_disabled` for orders paid online before the switch — refund those from the Cashfree dashboard; Cashfree is never called while disabled | Cashfree refund API |
 
-`GET /storefront/config` gains `"onlinePaymentsEnabled": bool`; the storefront hides the Razorpay
+`GET /storefront/config` gains `"onlinePaymentsEnabled": bool`; the storefront hides the Cashfree
 flow and shows "Order received — we'll contact you to confirm payment and dispatch" when false.
 `PAYMENT_TEST_MODE` (₹1 per unit) works in both modes.
 
@@ -482,7 +536,7 @@ flow and shows "Order received — we'll contact you to confirm payment and disp
   (product, pack, qty, unit price, line total); MRP total, savings (on the goods), subtotal,
   delivery ("₹500" or "FREE"), "Tax (GST): ₹0", amount payable; pricing tier
   ("Bulk price (₹5,000+ order)" / "Standard price (order below ₹5,000)"); payment method/status
-  (and Razorpay payment id when paid online); a button linking to the admin console
+  (and Cashfree payment id when paid online); a button linking to the admin console
   (`PUBLIC_SITE_URL` + `/?page=admin`, omitted if unset). Every value is HTML-escaped.
 
 ---
@@ -493,7 +547,7 @@ flow and shows "Order received — we'll contact you to confirm payment and disp
   message `customer.email is required …`). It receives the confirmation and tracking link.
 - Sent through the same transactional outbox (`email_outbox` kind `customer_order_confirmation`), queued in the
   same transaction and at the same moment as the admin notification: on placement when
-  `RAZORPAY_ENABLED=false`, on payment confirmation when `true`. Exactly one per order. Toggle with
+  `CASHFREE_ENABLED=false`, on payment confirmation when `true`. Exactly one per order. Toggle with
   `CUSTOMER_ORDER_EMAIL_ENABLED` (default `true`).
 - **Tracking link:** `{PUBLIC_SITE_URL}/?page=order&order=ZM-…#t=<orderToken>` (`Config::order_tracking_url`).
   The token stays in the URL fragment (never sent to servers/logs/Referer). `PUBLIC_SITE_URL` is required in

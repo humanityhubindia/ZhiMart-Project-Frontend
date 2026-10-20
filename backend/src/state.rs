@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
 use crate::{
-    auth::jwt::JwtKeys, config::Config, email::EmailSender, payments::RazorpayClient,
+    auth::jwt::JwtKeys, config::Config, email::EmailSender, payments::CashfreeClient,
     sheets::SheetsClient,
 };
 
@@ -15,7 +15,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub jwt: Arc<JwtKeys>,
     pub email: Arc<dyn EmailSender>,
-    pub razorpay: Arc<RazorpayClient>,
+    pub cashfree: Arc<CashfreeClient>,
     /// Google Sheets order sync client; `None` unless `GOOGLE_SHEETS_ENABLED=true`.
     /// Only the background worker uses it (never a request handler).
     pub sheets: Option<Arc<SheetsClient>>,
@@ -30,7 +30,7 @@ impl AppState {
         email: Arc<dyn EmailSender>,
     ) -> anyhow::Result<Self> {
         let jwt = Arc::new(JwtKeys::new(&config)?);
-        let razorpay = Arc::new(RazorpayClient::new(&config)?);
+        let cashfree = Arc::new(CashfreeClient::new(&config)?);
         let sheets = config
             .google_sheets
             .as_ref()
@@ -46,7 +46,7 @@ impl AppState {
             config,
             jwt,
             email,
-            razorpay,
+            cashfree,
             sheets,
             hash_permits: Arc::new(Semaphore::new(permits)),
         })

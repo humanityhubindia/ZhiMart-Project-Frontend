@@ -102,14 +102,14 @@ function PaymentModeBar() {
   if (!c) return null;
   // Older backends don't send the flag; treat a missing value as "on" (previous behaviour).
   const online = c.onlinePaymentsEnabled !== false;
-  const keyId = c.razorpayKeyId ?? '';
-  const keyKind = keyId.startsWith('rzp_test_') ? 'test' : keyId.startsWith('rzp_live_') ? 'live' : 'unknown';
+  // `CASHFREE_ENV` as exposed to the storefront: sandbox = simulated money, production = real.
+  const keyKind = c.cashfreeMode === 'sandbox' ? 'test' : c.cashfreeMode === 'production' ? 'live' : 'unknown';
   const keyLabel =
     keyKind === 'test'
-      ? 'Razorpay TEST keys — no real money moves'
+      ? 'Cashfree SANDBOX — no real money moves'
       : keyKind === 'live'
-        ? 'Razorpay LIVE keys — real ₹1 charges'
-        : 'Razorpay keys not configured';
+        ? 'Cashfree PRODUCTION — real ₹1 charges'
+        : 'Cashfree not configured';
 
   return (
     <>
@@ -139,11 +139,11 @@ function PaymentModeBar() {
         </div>
       )}
       {online && !c.testMode && keyKind !== 'live' && (
-        // Real prices with online payments on, but not wired to live keys: payments won't settle.
+        // Real prices with online payments on, but Cashfree is not in production: no real money moves.
         <div role="status" className="bg-slate-800 text-amber-300 border-b border-slate-900">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-1.5 text-[11px] font-extrabold">
             Real prices are on, but{' '}
-            {keyKind === 'test' ? 'Razorpay is using TEST keys — payments are simulated.' : 'no Razorpay key is configured.'}
+            {keyKind === 'test' ? 'Cashfree is in SANDBOX mode — payments are simulated.' : 'the Cashfree mode is not reported by the server.'}
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-//! Razorpay payment state on `orders`, the `refunds` ledger and the
+//! Online (Cashfree) payment state on `orders`, the `refunds` ledger and the
 //! `payment_events` webhook log.
 //!
 //! Every mutation of an order's payment state runs inside a transaction that
@@ -9,29 +9,29 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
-use crate::repo::orders::METHOD_RAZORPAY;
+use crate::repo::orders::METHOD_CASHFREE;
 
 // ---------------------------------------------------------------------------
 // Orders
 // ---------------------------------------------------------------------------
 
-/// Our order id for a Razorpay order id.
-pub async fn order_id_by_razorpay_order<'e>(
+/// Our order id for a gateway (Cashfree) order id.
+pub async fn order_id_by_gateway_order<'e>(
     conn: impl PgExecutor<'e>,
-    rzp_order_id: &str,
+    gateway_order_id: &str,
 ) -> sqlx::Result<Option<Uuid>> {
-    sqlx::query_scalar("SELECT id FROM orders WHERE razorpay_order_id = $1")
-        .bind(rzp_order_id)
+    sqlx::query_scalar("SELECT id FROM orders WHERE gateway_order_id = $1")
+        .bind(gateway_order_id)
         .fetch_optional(conn)
         .await
 }
 
-/// Our order id for the Razorpay payment recorded on it.
-pub async fn order_id_by_razorpay_payment<'e>(
+/// Our order id for the gateway payment recorded on it.
+pub async fn order_id_by_gateway_payment<'e>(
     conn: impl PgExecutor<'e>,
     payment_id: &str,
 ) -> sqlx::Result<Option<Uuid>> {
-    sqlx::query_scalar("SELECT id FROM orders WHERE razorpay_payment_id = $1")
+    sqlx::query_scalar("SELECT id FROM orders WHERE gateway_payment_id = $1")
         .bind(payment_id)
         .fetch_optional(conn)
         .await
@@ -51,26 +51,27 @@ pub async fn payment_window_open<'e>(
     .map(|v| v.unwrap_or(false))
 }
 
-/// Attach a freshly created Razorpay order, but only if none is attached yet
-/// and the order is still payable (optimistic claim: if another request won the
-/// race, this returns `false` and the caller uses the winner's id).
-pub async fn attach_razorpay_order<'e>(
+/// Attach our (deterministic) Cashfree order id, but only if none is attached
+/// yet and the order is still payable. Returns `false` if the guard did not
+/// match; the caller re-reads the order (a concurrent request attached the
+/// same id, or the order stopped being payable).
+pub async fn attach_gateway_order<'e>(
     conn: impl PgExecutor<'e>,
     order_id: Uuid,
-    rzp_order_id: &str,
+    gateway_order_id: &str,
 ) -> sqlx::Result<bool> {
     let r = sqlx::query(
         r#"
         UPDATE orders
-        SET razorpay_order_id = $2, version = version + 1, updated_at = now()
+        SET gateway_order_id = $2, version = version + 1, updated_at = now()
         WHERE id = $1
-          AND razorpay_order_id IS NULL
+          AND gateway_order_id IS NULL
           AND status = 'pending_payment'
           AND payment_expires_at > now()
         "#,
     )
     .bind(order_id)
-    .bind(rzp_order_id)
+    .bind(gateway_order_id)
     .execute(conn)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -90,20 +91,20 @@ pub async fn mark_paid(
         SET status = 'pending_pack',
             payment_status = 'paid',
             payment_method = $4,
-            razorpay_payment_id = $2,
+            gateway_payment_id = $2,
             payment_instrument = $3,
             paid_at = now(),
             cancelled_at = NULL,
             cancel_reason = NULL,
             version = version + 1,
             updated_at = now()
-        WHERE id = $1 AND status = 'pending_payment' AND razorpay_payment_id IS NULL
+        WHERE id = $1 AND status = 'pending_payment' AND gateway_payment_id IS NULL
         "#,
     )
     .bind(order_id)
     .bind(payment_id)
     .bind(instrument)
-    .bind(METHOD_RAZORPAY)
+    .bind(METHOD_CASHFREE)
     .execute(conn)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -125,20 +126,20 @@ pub async fn record_unfulfillable_payment(
         UPDATE orders
         SET payment_status = 'paid',
             payment_method = $5,
-            razorpay_payment_id = $2,
+            gateway_payment_id = $2,
             payment_instrument = $3,
             paid_at = now(),
             payment_attention = $4,
             version = version + 1,
             updated_at = now()
-        WHERE id = $1 AND razorpay_payment_id IS NULL
+        WHERE id = $1 AND gateway_payment_id IS NULL
         "#,
     )
     .bind(order_id)
     .bind(payment_id)
     .bind(instrument)
     .bind(attention)
-    .bind(METHOD_RAZORPAY)
+    .bind(METHOD_CASHFREE)
     .execute(conn)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -160,6 +161,31 @@ pub async fn set_attention<'e>(
     Ok(())
 }
 
+/// Unpaid orders whose payment window has closed and that have a Cashfree
+/// order, i.e. what the expiry sweep is about to cancel and should first check
+/// with Cashfree. Oldest first. No lock is taken (the caller calls the API).
+pub async fn expired_awaiting_gateway<'e>(
+    conn: impl PgExecutor<'e>,
+    limit: i64,
+) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id FROM orders
+        WHERE status = 'pending_payment'
+          AND payment_expires_at <= now()
+          AND payment_method = $2
+          AND gateway_order_id IS NOT NULL
+          AND gateway_payment_id IS NULL
+        ORDER BY payment_expires_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .bind(METHOD_CASHFREE)
+    .fetch_all(conn)
+    .await
+}
+
 /// Optimistic-concurrency bump (e.g. a refund was initiated or failed), so the
 /// admin console's sync marker notices the change.
 pub async fn bump_version<'e>(conn: impl PgExecutor<'e>, order_id: Uuid) -> sqlx::Result<()> {
@@ -171,8 +197,8 @@ pub async fn bump_version<'e>(conn: impl PgExecutor<'e>, order_id: Uuid) -> sqlx
 }
 
 /// Recompute `amount_refunded_paise` / `payment_status` / `refunded_at` from the
-/// refunds ledger: the sum of refunds Razorpay has accepted (have a
-/// `razorpay_refund_id`) and that have not failed, for the order's own payment
+/// refunds ledger: the sum of refunds Cashfree has accepted (have a
+/// `gateway_refund_id`) and that have not failed, for the order's own payment
 /// (refunds of duplicate payments do not count). Idempotent; bumps `version`
 /// only when something changed. The order row must be locked by the caller.
 pub async fn sync_refund_totals(conn: &mut PgConnection, order_id: Uuid) -> sqlx::Result<bool> {
@@ -183,8 +209,8 @@ pub async fn sync_refund_totals(conn: &mut PgConnection, order_id: Uuid) -> sqlx
             FROM refunds r
             JOIN orders o ON o.id = r.order_id
             WHERE r.order_id = $1
-              AND r.razorpay_payment_id = o.razorpay_payment_id
-              AND r.razorpay_refund_id IS NOT NULL
+              AND r.gateway_payment_id = o.gateway_payment_id
+              AND r.gateway_refund_id IS NOT NULL
               AND r.status <> 'failed'
         ),
         n AS (
@@ -227,7 +253,7 @@ pub const REFUND_FAILED: &str = "failed";
 pub struct NewRefund<'a> {
     pub id: Uuid,
     pub order_id: Uuid,
-    pub razorpay_payment_id: &'a str,
+    pub gateway_payment_id: &'a str,
     pub amount_paise: i64,
     pub reason: &'a str,
     pub initiated_by: Option<Uuid>,
@@ -236,13 +262,13 @@ pub struct NewRefund<'a> {
 pub async fn insert_refund(conn: &mut PgConnection, r: &NewRefund<'_>) -> sqlx::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO refunds (id, order_id, razorpay_payment_id, amount_paise, status, reason, initiated_by)
+        INSERT INTO refunds (id, order_id, gateway_payment_id, amount_paise, status, reason, initiated_by)
         VALUES ($1, $2, $3, $4, 'pending', $5, $6)
         "#,
     )
     .bind(r.id)
     .bind(r.order_id)
-    .bind(r.razorpay_payment_id)
+    .bind(r.gateway_payment_id)
     .bind(r.amount_paise)
     .bind(r.reason)
     .bind(r.initiated_by)
@@ -252,14 +278,14 @@ pub async fn insert_refund(conn: &mut PgConnection, r: &NewRefund<'_>) -> sqlx::
 }
 
 /// Sum of all refunds against `payment_id` that have not failed, including
-/// ones still being sent to Razorpay. Used to compute what is left to refund,
+/// ones still being sent to Cashfree. Used to compute what is left to refund,
 /// so concurrent refunds can never exceed the payment.
 pub async fn refunds_reserved_total(
     conn: &mut PgConnection,
     payment_id: &str,
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar(
-        "SELECT COALESCE(sum(amount_paise), 0)::bigint FROM refunds WHERE razorpay_payment_id = $1 AND status <> 'failed'",
+        "SELECT COALESCE(sum(amount_paise), 0)::bigint FROM refunds WHERE gateway_payment_id = $1 AND status <> 'failed'",
     )
     .bind(payment_id)
     .fetch_one(conn)
@@ -270,24 +296,24 @@ pub async fn refunds_reserved_total(
 pub struct RefundRow {
     pub id: Uuid,
     pub order_id: Uuid,
-    pub razorpay_payment_id: String,
-    pub razorpay_refund_id: Option<String>,
+    pub gateway_payment_id: String,
+    pub gateway_refund_id: Option<String>,
     pub amount_paise: i64,
     pub status: String,
     pub initiated_by: Option<Uuid>,
 }
 
 const REFUND_COLS: &str =
-    "id, order_id, razorpay_payment_id, razorpay_refund_id, amount_paise, status, initiated_by";
+    "id, order_id, gateway_payment_id, gateway_refund_id, amount_paise, status, initiated_by";
 
-pub async fn find_refund_by_razorpay_id<'e>(
+pub async fn find_refund_by_gateway_id<'e>(
     conn: impl PgExecutor<'e>,
-    rzp_refund_id: &str,
+    gateway_refund_id: &str,
 ) -> sqlx::Result<Option<RefundRow>> {
     sqlx::query_as::<_, RefundRow>(&format!(
-        "SELECT {REFUND_COLS} FROM refunds WHERE razorpay_refund_id = $1"
+        "SELECT {REFUND_COLS} FROM refunds WHERE gateway_refund_id = $1"
     ))
-    .bind(rzp_refund_id)
+    .bind(gateway_refund_id)
     .fetch_optional(conn)
     .await
 }
@@ -302,12 +328,12 @@ pub async fn find_refund<'e>(
         .await
 }
 
-/// Refunds of this order that were never confirmed by Razorpay (no refund id
+/// Refunds of this order that were never confirmed by Cashfree (no refund id
 /// yet, still `pending`), with whether they are old enough to give up on.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UnconfirmedRefund {
     pub id: Uuid,
-    pub razorpay_payment_id: String,
+    pub gateway_payment_id: String,
     pub amount_paise: i64,
     pub stale: bool,
 }
@@ -318,9 +344,9 @@ pub async fn unconfirmed_refunds<'e>(
 ) -> sqlx::Result<Vec<UnconfirmedRefund>> {
     sqlx::query_as::<_, UnconfirmedRefund>(
         r#"
-        SELECT id, razorpay_payment_id, amount_paise, created_at < now() - interval '15 minutes' AS stale
+        SELECT id, gateway_payment_id, amount_paise, created_at < now() - interval '15 minutes' AS stale
         FROM refunds
-        WHERE order_id = $1 AND status = 'pending' AND razorpay_refund_id IS NULL
+        WHERE order_id = $1 AND status = 'pending' AND gateway_refund_id IS NULL
         ORDER BY created_at
         "#,
     )
@@ -329,28 +355,28 @@ pub async fn unconfirmed_refunds<'e>(
     .await
 }
 
-/// Record Razorpay's refund id and status. A `processed` refund never goes
+/// Record Cashfree's refund id (`cf_refund_id`) and status. A `processed` refund never goes
 /// back to `pending`/`failed`. Returns `false` if the row was not updated
-/// (unknown id, or already bound to a different Razorpay refund).
+/// (unknown id, or already bound to a different Cashfree refund).
 pub async fn apply_refund_status(
     conn: &mut PgConnection,
     id: Uuid,
-    rzp_refund_id: &str,
+    gateway_refund_id: &str,
     status: &str,
     failure_reason: Option<&str>,
 ) -> sqlx::Result<bool> {
     let r = sqlx::query(
         r#"
         UPDATE refunds
-        SET razorpay_refund_id = $2,
+        SET gateway_refund_id = $2,
             status = CASE WHEN status = 'processed' THEN status ELSE $3 END,
             failure_reason = CASE WHEN status = 'processed' THEN failure_reason ELSE $4 END,
             updated_at = now()
-        WHERE id = $1 AND (razorpay_refund_id IS NULL OR razorpay_refund_id = $2)
+        WHERE id = $1 AND (gateway_refund_id IS NULL OR gateway_refund_id = $2)
         "#,
     )
     .bind(id)
-    .bind(rzp_refund_id)
+    .bind(gateway_refund_id)
     .bind(status)
     .bind(failure_reason)
     .execute(conn)
@@ -358,7 +384,7 @@ pub async fn apply_refund_status(
     Ok(r.rows_affected() == 1)
 }
 
-/// Mark a refund that Razorpay definitively did not accept.
+/// Mark a refund that Cashfree definitively did not accept.
 pub async fn fail_refund<'e>(
     conn: impl PgExecutor<'e>,
     id: Uuid,
@@ -367,7 +393,7 @@ pub async fn fail_refund<'e>(
     sqlx::query(
         r#"
         UPDATE refunds SET status = 'failed', failure_reason = $2, updated_at = now()
-        WHERE id = $1 AND status = 'pending' AND razorpay_refund_id IS NULL
+        WHERE id = $1 AND status = 'pending' AND gateway_refund_id IS NULL
         "#,
     )
     .bind(id)
@@ -387,12 +413,13 @@ pub async fn note_refund<'e>(conn: impl PgExecutor<'e>, id: Uuid, note: &str) ->
     Ok(())
 }
 
-/// A refund created outside this system (Razorpay Dashboard), learned from a webhook.
+/// A refund created outside this system (Cashfree Merchant Dashboard, or one
+/// of Cashfree's automatic refunds), learned from a webhook.
 pub async fn insert_external_refund(
     conn: &mut PgConnection,
     order_id: Uuid,
     payment_id: &str,
-    rzp_refund_id: &str,
+    gateway_refund_id: &str,
     amount_paise: i64,
     status: &str,
     reason: &str,
@@ -400,7 +427,7 @@ pub async fn insert_external_refund(
     let id = Uuid::now_v7();
     sqlx::query(
         r#"
-        INSERT INTO refunds (id, order_id, razorpay_payment_id, razorpay_refund_id, amount_paise, status, reason)
+        INSERT INTO refunds (id, order_id, gateway_payment_id, gateway_refund_id, amount_paise, status, reason)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT DO NOTHING
         "#,
@@ -408,7 +435,7 @@ pub async fn insert_external_refund(
     .bind(id)
     .bind(order_id)
     .bind(payment_id)
-    .bind(rzp_refund_id)
+    .bind(gateway_refund_id)
     .bind(amount_paise)
     .bind(status)
     .bind(reason)
@@ -426,8 +453,8 @@ pub struct NewEvent<'a> {
     pub id: &'a str,
     pub event: &'a str,
     pub order_id: Option<Uuid>,
-    pub razorpay_order_id: Option<&'a str>,
-    pub razorpay_payment_id: Option<&'a str>,
+    pub gateway_order_id: Option<&'a str>,
+    pub gateway_payment_id: Option<&'a str>,
     /// Redacted payload (ids, amounts, statuses — no customer contact data).
     pub payload: serde_json::Value,
 }
@@ -439,7 +466,7 @@ pub async fn record_event<'e>(conn: impl PgExecutor<'e>, e: &NewEvent<'_>) -> sq
     sqlx::query_scalar::<_, bool>(
         r#"
         WITH ins AS (
-            INSERT INTO payment_events (id, event, order_id, razorpay_order_id, razorpay_payment_id, payload)
+            INSERT INTO payment_events (id, event, order_id, gateway_order_id, gateway_payment_id, payload)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (id) DO NOTHING
             RETURNING id
@@ -453,8 +480,8 @@ pub async fn record_event<'e>(conn: impl PgExecutor<'e>, e: &NewEvent<'_>) -> sq
     .bind(e.id)
     .bind(e.event)
     .bind(e.order_id)
-    .bind(e.razorpay_order_id)
-    .bind(e.razorpay_payment_id)
+    .bind(e.gateway_order_id)
+    .bind(e.gateway_payment_id)
     .bind(&e.payload)
     .fetch_one(conn)
     .await
@@ -523,8 +550,8 @@ pub async fn list_events<'e>(
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RefundListRow {
     pub id: Uuid,
-    pub razorpay_refund_id: Option<String>,
-    pub razorpay_payment_id: String,
+    pub gateway_refund_id: Option<String>,
+    pub gateway_payment_id: String,
     pub amount_paise: i64,
     pub status: String,
     pub reason: String,
@@ -539,7 +566,7 @@ pub async fn list_refunds<'e>(
 ) -> sqlx::Result<Vec<RefundListRow>> {
     sqlx::query_as::<_, RefundListRow>(
         r#"
-        SELECT r.id, r.razorpay_refund_id, r.razorpay_payment_id, r.amount_paise, r.status, r.reason,
+        SELECT r.id, r.gateway_refund_id, r.gateway_payment_id, r.amount_paise, r.status, r.reason,
                r.failure_reason, a.email AS admin_email, r.created_at
         FROM refunds r
         LEFT JOIN admins a ON a.id = r.initiated_by

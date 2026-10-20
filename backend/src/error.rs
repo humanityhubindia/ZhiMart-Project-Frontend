@@ -77,7 +77,7 @@ pub enum AppError {
     #[error("service unavailable")]
     ServiceUnavailable,
 
-    /// The payment gateway (Razorpay) failed or timed out. Details are logged.
+    /// The payment gateway (Cashfree) failed or timed out. Details are logged.
     #[error("payment gateway error")]
     PaymentGateway,
 

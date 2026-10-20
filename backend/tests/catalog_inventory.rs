@@ -62,10 +62,11 @@ fn test_config() -> Config {
         ses_configuration_set: None,
         payments_enabled: true,
         payment_test_mode: false,
-        razorpay_key_id: "rzp_test_0123456789abcd".into(),
-        razorpay_key_secret: SecretString::from("test_key_secret_0123456789"),
-        razorpay_webhook_secret: SecretString::from("test_webhook_secret_0123456789"),
-        razorpay_api_base: "https://api.razorpay.com".into(),
+        cashfree_env: zhimart_backend::config::CashfreeEnv::Sandbox,
+        cashfree_app_id: "TEST1234567890abcdef".into(),
+        cashfree_secret_key: SecretString::from("cfsk_ma_test_0123456789abcdef"),
+        cashfree_api_base: "https://sandbox.cashfree.com/pg".into(),
+        cashfree_notify_url: None,
         payment_expiry: std::time::Duration::from_secs(30 * 60),
         store_name: "Zhi-Mart Fireworks".into(),
         order_notifications_enabled: false,
@@ -291,11 +292,7 @@ async fn seed_2026_catalog_is_present(pool: PgPool) {
     assert_eq!(num(&first["price"]), 32.0);
     assert_eq!(num(&first["originalPrice"]), 210.0);
     assert_eq!(first["discountPercent"], 85);
-    assert_eq!(
-        num(&first["standardPrice"]),
-        42.0,
-        "80% off MRP ₹210 = ₹42"
-    );
+    assert_eq!(num(&first["standardPrice"]), 42.0, "80% off MRP ₹210 = ₹42");
     assert_eq!(first["standardDiscountPercent"], 80);
     assert_eq!(first["inStock"], true);
     assert_eq!(

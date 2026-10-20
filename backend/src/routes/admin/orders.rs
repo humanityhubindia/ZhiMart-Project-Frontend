@@ -20,8 +20,8 @@ use crate::{
     repo::{
         self,
         orders::{
-            Cursor, ListFilter, METHOD_RAZORPAY, Order, OrderRef, OrderRow, OrderStatus,
-            PAYMENT_METHODS, PAYMENT_STATUSES, PaymentUpdate,
+            Cursor, ListFilter, Order, OrderRef, OrderRow, OrderStatus, PAYMENT_METHODS,
+            PAYMENT_STATUSES, PaymentUpdate,
         },
     },
     routes::{json::ApiJson, orders::clean_line},
@@ -538,11 +538,12 @@ async fn update_payment(
     if row.version != body.expected_version {
         return Err(version_conflict());
     }
-    // Razorpay payments are owned by the payment service (verified captures,
-    // refunds through the gateway); manual overrides would desync them.
-    if row.payment_method == METHOD_RAZORPAY {
+    // Online payments (Cashfree, legacy Razorpay) are owned by the payment
+    // service (gateway-verified settlement, refunds through the gateway);
+    // manual overrides would desync them.
+    if repo::orders::is_online_method(&row.payment_method) {
         return Err(invalid_transition(
-            "Online (Razorpay) payments cannot be changed manually; use a refund instead.",
+            "Online (gateway) payments cannot be changed manually; use a refund instead.",
         ));
     }
     let status = current_status(&row)?;

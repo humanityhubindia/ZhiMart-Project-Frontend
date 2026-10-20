@@ -76,23 +76,30 @@ pub struct Config {
     pub ses_from_address: String,
     pub ses_configuration_set: Option<String>,
 
-    // Payments (Razorpay)
-    /// Master switch for online payments (`RAZORPAY_ENABLED`, default false).
+    // Payments (Cashfree)
+    /// Master switch for online payments (`CASHFREE_ENABLED`, default false).
     /// Off ⇒ checkout places `pay_later` orders straight into `pending_pack`
     /// (stock deducted, no payment window) and the admin collects payment
-    /// offline; the Razorpay keys are then optional.
+    /// offline; the Cashfree keys are then optional.
     pub payments_enabled: bool,
     /// When true every product is charged at [`TEST_MODE_UNIT_PRICE_PAISE`]
     /// (₹1) per unit, enforced server-side, and orders are flagged `is_test`.
     pub payment_test_mode: bool,
-    pub razorpay_key_id: String,
-    pub razorpay_key_secret: SecretString,
-    pub razorpay_webhook_secret: SecretString,
-    /// Base URL of the Razorpay REST API (overridable only for tests/mocks).
-    pub razorpay_api_base: String,
+    /// `CASHFREE_ENV`: picks the API base and is the storefront SDK `mode`.
+    pub cashfree_env: CashfreeEnv,
+    /// `CASHFREE_APP_ID` (the "client id"; not secret).
+    pub cashfree_app_id: String,
+    /// `CASHFREE_SECRET_KEY`: API secret, also the webhook signing key.
+    pub cashfree_secret_key: SecretString,
+    /// Base URL of the Cashfree PG API: [`CashfreeEnv::api_base`] unless
+    /// `CASHFREE_API_BASE` overrides it (tests/mocks only; refused in production).
+    pub cashfree_api_base: String,
+    /// `CASHFREE_NOTIFY_URL`: optional https webhook URL sent per order as
+    /// `order_meta.notify_url` (the dashboard webhook endpoint works without it).
+    pub cashfree_notify_url: Option<String>,
     /// Unpaid orders hold their stock reservation this long, then expire.
     pub payment_expiry: Duration,
-    /// Merchant name shown in the Razorpay checkout modal.
+    /// Store name shown on the storefront and in emails.
     pub store_name: String,
 
     // Order notifications
@@ -310,6 +317,54 @@ impl std::fmt::Debug for GoogleSheetsConfig {
     }
 }
 
+/// Cashfree environment (`CASHFREE_ENV`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CashfreeEnv {
+    /// Test credentials; no real money moves.
+    Sandbox,
+    /// Live credentials; payments are real.
+    Production,
+}
+
+pub const CASHFREE_SANDBOX_API: &str = "https://sandbox.cashfree.com/pg";
+pub const CASHFREE_PRODUCTION_API: &str = "https://api.cashfree.com/pg";
+
+impl CashfreeEnv {
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sandbox" | "test" => Ok(CashfreeEnv::Sandbox),
+            "production" | "prod" | "live" => Ok(CashfreeEnv::Production),
+            other => bail!("CASHFREE_ENV must be 'sandbox' or 'production', got '{other}'"),
+        }
+    }
+
+    /// Also the JS SDK `mode` (`Cashfree({ mode })`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CashfreeEnv::Sandbox => "sandbox",
+            CashfreeEnv::Production => "production",
+        }
+    }
+
+    pub fn api_base(self) -> &'static str {
+        match self {
+            CashfreeEnv::Sandbox => CASHFREE_SANDBOX_API,
+            CashfreeEnv::Production => CASHFREE_PRODUCTION_API,
+        }
+    }
+}
+
+/// Names of `RAZORPAY_*` variables still present in the environment. Razorpay
+/// support was removed; they are ignored (main logs a warning naming them).
+pub fn legacy_razorpay_vars() -> Vec<String> {
+    let mut v: Vec<String> = env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| k.starts_with("RAZORPAY_"))
+        .collect();
+    v.sort();
+    v
+}
+
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_SHEETS_API: &str = "https://sheets.googleapis.com";
 pub const GOOGLE_SHEETS_DEFAULT_TAB: &str = "Orders";
@@ -420,7 +475,6 @@ const DEV_SITE_URL: &str = "http://localhost:5173";
 
 /// Unit price charged for every product while `PAYMENT_TEST_MODE=true`.
 pub const TEST_MODE_UNIT_PRICE_PAISE: i64 = 100;
-const RAZORPAY_PRODUCTION_API: &str = "https://api.razorpay.com";
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -468,6 +522,8 @@ impl Config {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        let cashfree_env = CashfreeEnv::parse(&var_or("CASHFREE_ENV", "sandbox"))?;
+
         let cfg = Config {
             app_env,
             bind_addr: parse_or("BIND_ADDR", "0.0.0.0:8080")?,
@@ -507,14 +563,21 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
 
-            payments_enabled: parse_or("RAZORPAY_ENABLED", "false")?,
+            payments_enabled: parse_or("CASHFREE_ENABLED", "false")?,
             payment_test_mode: parse_or("PAYMENT_TEST_MODE", "false")?,
-            razorpay_key_id: var_or("RAZORPAY_KEY_ID", "").trim().to_owned(),
-            razorpay_key_secret: SecretString::from(var_or("RAZORPAY_KEY_SECRET", "")),
-            razorpay_webhook_secret: SecretString::from(var_or("RAZORPAY_WEBHOOK_SECRET", "")),
-            razorpay_api_base: var_or("RAZORPAY_API_BASE", RAZORPAY_PRODUCTION_API)
+            cashfree_env,
+            cashfree_app_id: var_or("CASHFREE_APP_ID", "").trim().to_owned(),
+            cashfree_secret_key: SecretString::from(
+                var_or("CASHFREE_SECRET_KEY", "").trim().to_owned(),
+            ),
+            cashfree_api_base: var_or("CASHFREE_API_BASE", cashfree_env.api_base())
+                .trim()
                 .trim_end_matches('/')
                 .to_owned(),
+            cashfree_notify_url: env::var("CASHFREE_NOTIFY_URL")
+                .ok()
+                .map(|u| u.trim().to_owned())
+                .filter(|u| !u.is_empty()),
             payment_expiry: Duration::from_secs(
                 60 * parse_or::<u64>("PAYMENT_EXPIRY_MINUTES", "30")?,
             ),
@@ -619,26 +682,7 @@ impl Config {
             );
         }
 
-        if self.payments_enabled {
-            ensure!(
-                self.razorpay_key_id.starts_with("rzp_test_")
-                    || self.razorpay_key_id.starts_with("rzp_live_"),
-                "RAZORPAY_ENABLED=true requires RAZORPAY_KEY_ID (rzp_test_... or rzp_live_...)"
-            );
-            ensure!(
-                self.razorpay_key_secret.expose_secret().len() >= 16,
-                "RAZORPAY_ENABLED=true requires RAZORPAY_KEY_SECRET"
-            );
-            ensure!(
-                self.razorpay_webhook_secret.expose_secret().len() >= 16,
-                "RAZORPAY_ENABLED=true requires RAZORPAY_WEBHOOK_SECRET (min 16 chars; same value as the Razorpay dashboard webhook)"
-            );
-            ensure!(
-                self.razorpay_webhook_secret.expose_secret()
-                    != self.razorpay_key_secret.expose_secret(),
-                "RAZORPAY_WEBHOOK_SECRET must differ from RAZORPAY_KEY_SECRET"
-            );
-        }
+        self.validate_cashfree()?;
         for e in &self.order_notification_emails {
             ensure!(
                 e.len() <= 254
@@ -666,25 +710,11 @@ impl Config {
             !self.store_name.trim().is_empty() && self.store_name.len() <= 80,
             "STORE_NAME must be 1-80 characters"
         );
-        ensure!(
-            self.razorpay_api_base.starts_with("https://") || !self.app_env.is_production(),
-            "RAZORPAY_API_BASE must be https"
-        );
 
         if self.app_env.is_production() {
             ensure!(
                 !self.customer_order_emails_enabled || self.public_site_url.is_some(),
                 "PUBLIC_SITE_URL must be set in production when CUSTOMER_ORDER_EMAIL_ENABLED=true (it builds the customer's tracking link)"
-            );
-            ensure!(
-                self.razorpay_api_base == RAZORPAY_PRODUCTION_API,
-                "RAZORPAY_API_BASE cannot be overridden in production"
-            );
-            ensure!(
-                !self.payments_enabled
-                    || self.payment_test_mode
-                    || self.razorpay_key_id.starts_with("rzp_live_"),
-                "APP_ENV=production with RAZORPAY_ENABLED=true and PAYMENT_TEST_MODE=false requires live Razorpay keys (rzp_live_...)"
             );
             ensure!(
                 self.cookie_secure,
@@ -706,6 +736,85 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// Cashfree settings. The API base / notify URL are checked whatever the
+    /// switch says (they are cheap to get right); credentials only when enabled.
+    fn validate_cashfree(&self) -> anyhow::Result<()> {
+        let prod = self.app_env.is_production();
+        ensure!(
+            self.cashfree_api_base.starts_with("https://")
+                || (!prod && self.cashfree_api_base.starts_with("http://")),
+            "CASHFREE_API_BASE must be an https:// URL"
+        );
+        if let Some(u) = &self.cashfree_notify_url {
+            ensure!(
+                u.starts_with("https://")
+                    && u.len() <= 250
+                    && !u.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "CASHFREE_NOTIFY_URL must be an https:// URL of at most 250 characters (Cashfree requirement)"
+            );
+        }
+        if prod {
+            ensure!(
+                self.cashfree_api_base == self.cashfree_env.api_base(),
+                "CASHFREE_API_BASE cannot be overridden in production (set CASHFREE_ENV instead)"
+            );
+        }
+        if !self.payments_enabled {
+            return Ok(());
+        }
+        let app_id = self.cashfree_app_id.as_str();
+        ensure!(
+            (4..=100).contains(&app_id.len())
+                && app_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "CASHFREE_ENABLED=true requires CASHFREE_APP_ID (Cashfree Merchant Dashboard → Developers → API Keys)"
+        );
+        let secret = self.cashfree_secret_key.expose_secret();
+        ensure!(
+            secret.len() >= 16
+                && secret.len() <= 200
+                && !secret.chars().any(|c| c.is_whitespace() || c.is_control()),
+            "CASHFREE_ENABLED=true requires CASHFREE_SECRET_KEY (min 16 chars, no spaces)"
+        );
+        ensure!(
+            secret != app_id,
+            "CASHFREE_SECRET_KEY must not equal CASHFREE_APP_ID"
+        );
+        if prod {
+            ensure!(
+                self.payment_test_mode || self.cashfree_env == CashfreeEnv::Production,
+                "APP_ENV=production with CASHFREE_ENABLED=true and PAYMENT_TEST_MODE=false requires CASHFREE_ENV=production (live keys)"
+            );
+            ensure!(
+                self.public_site_url.is_some(),
+                "PUBLIC_SITE_URL must be set in production when CASHFREE_ENABLED=true (it builds the Cashfree return_url; whitelist its domain in the Cashfree dashboard)"
+            );
+        }
+        ensure!(
+            self.cashfree_return_url("ZM-000000-0000000000000000000")
+                .len()
+                <= 250,
+            "PUBLIC_SITE_URL is too long for a Cashfree return_url (max 250 characters)"
+        );
+        Ok(())
+    }
+
+    /// Where Cashfree sends the customer after checkout (redirect flows). It
+    /// deliberately carries NO order token (Cashfree would see and log it):
+    /// the storefront recovers the token from sessionStorage.
+    pub fn cashfree_return_url(&self, order_number: &str) -> String {
+        format!(
+            "{}/?page=order&order={order_number}&cf_return=1",
+            self.site_url()
+        )
+    }
+
+    /// `true` when Cashfree runs against the sandbox (no real money moves).
+    pub fn cashfree_is_sandbox(&self) -> bool {
+        self.cashfree_env == CashfreeEnv::Sandbox
     }
 
     /// Name of the refresh-token cookie. The `__Secure-` prefix makes browsers
@@ -743,11 +852,6 @@ impl Config {
             p.delivery_fee_paise = p.delivery_fee_paise.min(TEST_MODE_UNIT_PRICE_PAISE);
         }
         p
-    }
-
-    /// `true` when the configured Razorpay keys are test-mode keys (no real money moves).
-    pub fn razorpay_is_test_key(&self) -> bool {
-        self.razorpay_key_id.starts_with("rzp_test_")
     }
 
     pub fn is_allowed_origin(&self, origin: &[u8]) -> bool {
@@ -794,7 +898,124 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Pricing, normalize_spreadsheet_id};
+    use secrecy::SecretString;
+
+    use super::{
+        AppEnv, CASHFREE_PRODUCTION_API, CASHFREE_SANDBOX_API, CashfreeEnv, Config, EmailProvider,
+        Pricing, normalize_spreadsheet_id, test_support,
+    };
+
+    type Tweak = Box<dyn Fn(&mut Config)>;
+
+    /// A production config that passes validation, Cashfree live.
+    fn prod() -> Config {
+        let mut c = test_support::config();
+        c.app_env = AppEnv::Production;
+        c.email_provider = EmailProvider::Ses;
+        c.ses_from_address = "no-reply@zhimart.in".into();
+        c.public_site_url = Some("https://zhimart.in".into());
+        c.cashfree_env = CashfreeEnv::Production;
+        c.cashfree_api_base = CASHFREE_PRODUCTION_API.into();
+        c
+    }
+
+    #[test]
+    fn cashfree_env_parsing_and_bases() {
+        assert_eq!(
+            CashfreeEnv::parse("sandbox").ok(),
+            Some(CashfreeEnv::Sandbox)
+        );
+        assert_eq!(
+            CashfreeEnv::parse(" PRODUCTION ").ok(),
+            Some(CashfreeEnv::Production)
+        );
+        assert!(CashfreeEnv::parse("staging").is_err());
+        assert_eq!(CashfreeEnv::Sandbox.api_base(), CASHFREE_SANDBOX_API);
+        assert_eq!(CashfreeEnv::Production.as_str(), "production");
+    }
+
+    #[test]
+    fn cashfree_validation() {
+        assert!(
+            test_support::config().validate().is_ok(),
+            "dev sandbox config"
+        );
+        assert!(prod().validate().is_ok(), "{:?}", prod().validate().err());
+
+        let bad: Vec<(&str, Tweak)> = vec![
+            ("missing app id", Box::new(|c| c.cashfree_app_id.clear())),
+            (
+                "app id with spaces",
+                Box::new(|c| c.cashfree_app_id = "TEST 123".into()),
+            ),
+            (
+                "short secret",
+                Box::new(|c| c.cashfree_secret_key = SecretString::from("short")),
+            ),
+            (
+                "secret with spaces",
+                Box::new(|c| c.cashfree_secret_key = SecretString::from("cfsk ma prod 0123456789")),
+            ),
+            (
+                "sandbox in production",
+                Box::new(|c| {
+                    c.cashfree_env = CashfreeEnv::Sandbox;
+                    c.cashfree_api_base = CASHFREE_SANDBOX_API.into();
+                }),
+            ),
+            (
+                "api base override",
+                Box::new(|c| c.cashfree_api_base = "https://evil.example.com/pg".into()),
+            ),
+            ("no site url", Box::new(|c| c.public_site_url = None)),
+            (
+                "http notify url",
+                Box::new(|c| {
+                    c.cashfree_notify_url =
+                        Some("http://api.zhimart.in/api/v1/webhooks/cashfree".into())
+                }),
+            ),
+        ];
+        for (why, tweak) in bad {
+            let mut c = prod();
+            tweak(&mut c);
+            assert!(c.validate().is_err(), "{why} must be refused");
+        }
+
+        // Sandbox is fine in production while PAYMENT_TEST_MODE=true (₹1 orders).
+        let mut c = prod();
+        c.payment_test_mode = true;
+        c.cashfree_env = CashfreeEnv::Sandbox;
+        c.cashfree_api_base = CASHFREE_SANDBOX_API.into();
+        assert!(c.validate().is_ok());
+
+        // Disabled: no credentials needed, but the API base is still pinned in production.
+        let mut c = prod();
+        c.payments_enabled = false;
+        c.cashfree_app_id.clear();
+        c.cashfree_secret_key = SecretString::from("");
+        c.public_site_url = None;
+        assert!(c.validate().is_ok(), "{:?}", c.validate().err());
+        c.cashfree_api_base = "http://127.0.0.1:9/pg".into();
+        assert!(c.validate().is_err());
+
+        // Development may point at a local mock over plain http.
+        let mut c = test_support::config();
+        c.cashfree_api_base = "http://127.0.0.1:9/pg".into();
+        assert!(c.validate().is_ok());
+        c.cashfree_notify_url = Some("https://api.zhimart.in/api/v1/webhooks/cashfree".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn return_url_has_no_token() {
+        let c = prod();
+        assert_eq!(
+            c.cashfree_return_url("ZM-261020-1001"),
+            "https://zhimart.in/?page=order&order=ZM-261020-1001&cf_return=1"
+        );
+        assert!(!c.cashfree_return_url("ZM-261020-1001").contains('#'));
+    }
 
     #[test]
     fn spreadsheet_id_from_url_or_bare() {

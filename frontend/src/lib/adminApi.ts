@@ -114,7 +114,7 @@ export function createAdminApi(authFetch: AuthFetch) {
     recordPayment: (id: string, input: OrderPaymentInput) =>
       authFetch<Order>(`/admin/orders/${enc(id)}/payment`, { method: 'POST', body: input }),
 
-    /** Razorpay refund (full when `amount` is null). Longer timeout: the server calls Razorpay. */
+    /** Cashfree refund (full when `amount` is null). Longer timeout: the server calls Cashfree. */
     refundOrder: (id: string, input: OrderRefundInput) =>
       authFetch<Order>(`/admin/orders/${enc(id)}/refund`, { method: 'POST', body: input, timeoutMs: 45_000 }),
 

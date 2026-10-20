@@ -250,7 +250,7 @@ function OrderCard({
             <div className="flex justify-between text-xs">
               <span className="text-slate-500 font-bold">Ref / UTR:</span>
               <span className="font-mono font-bold text-slate-700 truncate ml-2 max-w-[120px]">
-                {order.payment.razorpayPaymentId || order.payment.reference || (
+                {order.payment.gatewayPaymentId || order.payment.reference || (
                   <span className="text-slate-400 italic">Pending Entry</span>
                 )}
               </span>

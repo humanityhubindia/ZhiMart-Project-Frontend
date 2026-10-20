@@ -168,14 +168,14 @@ export function buildOrderShareMessage(
 
 /**
  * Checkout button/copy for the current payment mode. `online` is `undefined` while the storefront
- * config is loading — use neutral wording so Razorpay copy never flashes in pay-later mode.
+ * config is loading — use neutral wording so online-payment copy never flashes in pay-later mode.
  */
 export function checkoutCopy(online: boolean | undefined) {
   if (online === true) {
     return {
       action: 'Proceed to Pay',
       pending: 'Reserving your items…',
-      note: 'Your items are reserved while you pay securely online via Razorpay (UPI, cards, net banking). Unpaid orders are released automatically.',
+      note: 'Your items are reserved while you pay securely online via Cashfree (UPI, cards, net banking, wallets). Unpaid orders are released automatically.',
     };
   }
   if (online === false) {

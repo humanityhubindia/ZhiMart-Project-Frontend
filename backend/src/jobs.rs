@@ -18,6 +18,7 @@ use crate::{
     config::Config,
     email::{EmailSender, OutboundEmail, templates},
     middleware::rate_limit::RateLimiters,
+    payments,
     repo::{
         self,
         orders::{Order, OrderRef},
@@ -72,6 +73,12 @@ const EXPIRY_BATCH: i64 = 200;
 /// function can never spin this loop; the backlog continues next tick.
 const EXPIRY_MAX_BATCHES_PER_TICK: u32 = 50;
 const EXPIRY_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Before cancelling, ask Cashfree about at most this many expired orders per
+/// tick, within this much wall time (each check is one or two GETs of ≤ 10 s).
+/// Anything beyond is cancelled unchecked: a late payment still revives or
+/// refunds it, and the webhook re-triggers that.
+const EXPIRY_RECONCILE_LIMIT: i64 = 100;
+const EXPIRY_RECONCILE_BUDGET: Duration = Duration::from_secs(20);
 
 const LIMITER_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// Log loudly if a limiter is tracking this many distinct keys after GC: it
@@ -87,7 +94,7 @@ pub fn spawn(
 ) -> Vec<JoinHandle<()>> {
     let db = state.db.clone();
     let mut handles = vec![
-        tokio::spawn(expiry_loop(db.clone(), shutdown.clone())),
+        tokio::spawn(expiry_loop(state.clone(), shutdown.clone())),
         tokio::spawn(maintenance_loop(db.clone(), shutdown.clone())),
         tokio::spawn(limiter_gc_loop(limiters, shutdown.clone())),
     ];
@@ -554,14 +561,15 @@ fn jitter(max: Duration) -> Duration {
     Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
 }
 
-async fn expiry_loop(db: PgPool, mut shutdown: watch::Receiver<bool>) {
+async fn expiry_loop(state: AppState, mut shutdown: watch::Receiver<bool>) {
     let mut delay = EXPIRY_INITIAL_DELAY + jitter(EXPIRY_JITTER);
     loop {
         tokio::select! {
             _ = shutdown_requested(&mut shutdown) => break,
             _ = tokio::time::sleep(delay) => {}
         }
-        let expired = expire_backlog(&db, &shutdown).await;
+        reconcile_before_expiry(&state).await;
+        let expired = expire_backlog(&state.db, &shutdown).await;
         if expired > 0 {
             tracing::info!(
                 expired,
@@ -571,6 +579,32 @@ async fn expiry_loop(db: PgPool, mut shutdown: watch::Receiver<bool>) {
         delay = EXPIRY_INTERVAL + jitter(EXPIRY_JITTER);
     }
     tracing::debug!("payment expiry job stopped");
+}
+
+/// Best-effort: settle expired orders that Cashfree says were paid, so the
+/// sweep does not cancel (and later revive or refund) them. Never holds a row
+/// lock across the HTTP calls; Cashfree being down just means "cancel anyway".
+pub async fn reconcile_before_expiry(state: &AppState) -> payments::service::SweepReconcile {
+    let run = payments::service::reconcile_expiring_orders(
+        state,
+        EXPIRY_RECONCILE_LIMIT,
+        EXPIRY_RECONCILE_BUDGET,
+    )
+    .await;
+    if run.paid > 0 {
+        tracing::info!(
+            checked = run.checked,
+            paid = run.paid,
+            "payment expiry: orders paid at Cashfree were settled instead of cancelled"
+        );
+    }
+    if run.gateway_unavailable {
+        tracing::warn!(
+            checked = run.checked,
+            "payment expiry: Cashfree unavailable; expiring the remaining orders unchecked"
+        );
+    }
+    run
 }
 
 /// Expire batches until one comes back short (backlog drained), an error

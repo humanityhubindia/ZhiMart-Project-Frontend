@@ -1,9 +1,15 @@
-//! Guest payment endpoints and the Razorpay webhook.
+//! Guest payment endpoints and the Cashfree webhook.
 //!
 //! Guests have no account: the `X-Order-Token` header (see
 //! `payments::order_token`) authorizes pay / verify / status for one order. A
 //! missing or wrong token is answered exactly like an unknown order (404), and
 //! the token is checked before anything about the order is revealed.
+//!
+//! Flow: `POST /pay` creates (once) or fetches the order's Cashfree order and
+//! returns its `paymentSessionId` for the JS SDK; after checkout the storefront
+//! calls `POST /pay/verify` (repeatedly while a payment is pending), which
+//! re-reads the payments from the Cashfree API and settles a successful one.
+//! The signed webhook triggers the same re-read server-to-server.
 
 use axum::{
     Json, Router,
@@ -15,48 +21,57 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use secrecy::ExposeSecret;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
     money::serialize_rupees,
     payments::{
-        order_token,
+        cashfree, order_token,
         service::{self, SettleError, SettleOutcome, Source},
         signature,
     },
     repo::{
         self,
-        orders::{OrderItem, OrderRef, OrderRow, Shipping},
+        orders::{METHOD_CASHFREE, OrderItem, OrderRef, OrderRow, Shipping},
     },
-    routes::{catalog::PricingInfo, json::ApiJson},
+    routes::catalog::PricingInfo,
     state::AppState,
 };
 
 /// Header carrying the guest order token.
 pub const ORDER_TOKEN_HEADER: &str = "x-order-token";
-pub const WEBHOOK_SIGNATURE_HEADER: &str = "x-razorpay-signature";
-pub const WEBHOOK_EVENT_ID_HEADER: &str = "x-razorpay-event-id";
+pub const WEBHOOK_SIGNATURE_HEADER: &str = "x-webhook-signature";
+pub const WEBHOOK_TIMESTAMP_HEADER: &str = "x-webhook-timestamp";
 /// Webhook bodies are small JSON documents.
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
+/// Gateway name in the storefront config / pay response.
+pub const GATEWAY: &str = "cashfree";
+/// Longest `payment_session_id` we pass on (Cashfree's are a few hundred chars).
+const MAX_SESSION_ID_LEN: usize = 1024;
 
 /// Public guest payment endpoints: GET /storefront/config, POST /orders/{orderNumber}/pay,
-/// POST /orders/{orderNumber}/pay/verify, GET /orders/{orderNumber}.
+/// GET /orders/{orderNumber}. `POST /pay/verify` is separate ([`verify_routes`])
+/// so it can have its own rate limit (the storefront polls it).
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/storefront/config", get(storefront_config))
         .route("/orders/{order_number}", get(guest_order))
         .route("/orders/{order_number}/pay", post(pay))
-        .route("/orders/{order_number}/pay/verify", post(verify))
 }
 
-/// POST /webhooks/razorpay. Authenticated by the HMAC signature only; mounted
+/// POST /orders/{orderNumber}/pay/verify.
+pub fn verify_routes() -> Router<AppState> {
+    Router::new().route("/orders/{order_number}/pay/verify", post(verify))
+}
+
+/// POST /webhooks/cashfree. Authenticated by the HMAC signature only; mounted
 /// outside the per-IP limiters by app.rs.
 pub fn webhook_routes() -> Router<AppState> {
     Router::new()
-        .route("/webhooks/razorpay", post(webhook))
+        .route("/webhooks/cashfree", post(webhook))
         .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES))
 }
 
@@ -64,10 +79,14 @@ pub fn webhook_routes() -> Router<AppState> {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// `AppError` plus `400 payment_verification_failed`.
+/// `AppError` plus the two 400s of `/pay/verify`.
 #[derive(Debug)]
 enum PayError {
     App(AppError),
+    /// No successful (or pending) payment on the order: the customer may retry.
+    NotCompleted,
+    /// A successful payment exists but does not match the order (amount,
+    /// currency, order id). Never paid; flagged for the admins.
     VerificationFailed,
 }
 
@@ -85,19 +104,22 @@ impl From<sqlx::Error> for PayError {
 
 impl IntoResponse for PayError {
     fn into_response(self) -> Response {
-        match self {
-            PayError::App(e) => e.into_response(),
-            PayError::VerificationFailed => {
-                let body = json!({ "error": {
-                    "code": "payment_verification_failed",
-                    "message": "We could not verify this payment. If money was deducted, it will be confirmed or refunded automatically.",
-                }});
-                let mut res = (StatusCode::BAD_REQUEST, Json(body)).into_response();
-                res.headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                res
-            }
-        }
+        let (code, message) = match self {
+            PayError::App(e) => return e.into_response(),
+            PayError::NotCompleted => (
+                "payment_not_completed",
+                "The payment was not completed. You can try again.",
+            ),
+            PayError::VerificationFailed => (
+                "payment_verification_failed",
+                "We could not verify this payment. If money was deducted, it will be confirmed or refunded automatically.",
+            ),
+        };
+        let body = json!({ "error": { "code": code, "message": message } });
+        let mut res = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        res
     }
 }
 
@@ -113,7 +135,11 @@ const ORDER_EXPIRED: AppError = conflict(
 );
 const ORDER_NOT_PAYABLE: AppError =
     conflict("order_not_payable", "This order can no longer be paid.");
-/// `RAZORPAY_ENABLED=false`: orders are pay-later and settled by an admin.
+const PAYMENT_PENDING: AppError = conflict(
+    "payment_pending",
+    "Your payment is still being processed. This page will update automatically once it is confirmed.",
+);
+/// `CASHFREE_ENABLED=false`: orders are pay-later and settled by an admin.
 pub const ONLINE_PAYMENTS_DISABLED: AppError = conflict(
     "online_payments_disabled",
     "Online payment is not available. We will contact you to confirm payment and dispatch.",
@@ -136,8 +162,10 @@ fn require_payments_enabled(state: &AppState) -> AppResult<()> {
 struct StorefrontConfig<'a> {
     test_mode: bool,
     online_payments_enabled: bool,
-    /// `null` while online payments are disabled (the key may be unset).
-    razorpay_key_id: Option<&'a str>,
+    /// `"cashfree"`, or `null` while online payments are disabled.
+    payment_gateway: Option<&'static str>,
+    /// Cashfree JS SDK mode (`sandbox` | `production`); `null` when disabled.
+    cashfree_mode: Option<&'static str>,
     currency: &'static str,
     payment_expiry_minutes: u64,
     store_name: &'a str,
@@ -147,7 +175,7 @@ struct StorefrontConfig<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GuestPayment {
-    /// `pay_later` | `razorpay` | … (the storefront keys its "order received" view on it).
+    /// `pay_later` | `cashfree` | … (the storefront keys its "order received" view on it).
     method: String,
     status: String,
     instrument: Option<String>,
@@ -184,42 +212,19 @@ struct GuestOrder {
     city: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Prefill {
-    name: String,
-    email: Option<String>,
-    contact: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CheckoutNotes {
-    order_number: String,
-}
-
-/// Options for Razorpay Checkout (`new Razorpay({...})`).
+/// What the storefront needs to open Cashfree checkout
+/// (`Cashfree({ mode }).checkout({ paymentSessionId })`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PayResponse {
-    key_id: String,
-    razorpay_order_id: String,
+    gateway: &'static str,
+    payment_session_id: String,
+    gateway_order_id: String,
     amount_paise: i64,
     currency: &'static str,
-    name: String,
-    description: String,
-    prefill: Prefill,
-    notes: CheckoutNotes,
+    mode: &'static str,
     payment_expires_at: Option<DateTime<Utc>>,
     test_mode: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct VerifyRequest {
-    razorpay_order_id: String,
-    razorpay_payment_id: String,
-    razorpay_signature: String,
 }
 
 fn no_store<T: Serialize>(body: T) -> Response {
@@ -331,11 +336,12 @@ async fn reload_guest_view(state: &AppState, order_id: Uuid) -> AppResult<GuestO
 
 async fn storefront_config(State(state): State<AppState>) -> Response {
     let c = &state.config;
+    let on = c.payments_enabled;
     let mut res = Json(StorefrontConfig {
         test_mode: c.payment_test_mode,
-        online_payments_enabled: c.payments_enabled,
-        razorpay_key_id: (c.payments_enabled && !c.razorpay_key_id.is_empty())
-            .then_some(c.razorpay_key_id.as_str()),
+        online_payments_enabled: on,
+        payment_gateway: on.then_some(GATEWAY),
+        cashfree_mode: on.then(|| c.cashfree_env.as_str()),
         currency: "INR",
         payment_expiry_minutes: c.payment_expiry.as_secs() / 60,
         store_name: &c.store_name,
@@ -362,9 +368,10 @@ async fn guest_order(
 /// Why an order cannot be paid now, if it cannot.
 fn payability(row: &OrderRow, window_open: bool) -> Result<(), AppError> {
     let money_in = matches!(row.payment_status.as_str(), "paid" | "refunded")
-        || row.razorpay_payment_id.is_some();
+        || row.gateway_payment_id.is_some();
     match row.status.as_str() {
         "pending_payment" if money_in => Err(ORDER_ALREADY_PAID),
+        "pending_payment" if row.payment_method != METHOD_CASHFREE => Err(ORDER_NOT_PAYABLE),
         "pending_payment" if window_open => Ok(()),
         "pending_payment" => Err(ORDER_EXPIRED),
         "cancelled" if service::cancelled_by_expiry(row) => Err(ORDER_EXPIRED),
@@ -374,35 +381,23 @@ fn payability(row: &OrderRow, window_open: bool) -> Result<(), AppError> {
     }
 }
 
-fn pay_response(state: &AppState, row: &OrderRow, rzp_order_id: String) -> PayResponse {
-    PayResponse {
-        key_id: state.config.razorpay_key_id.clone(),
-        razorpay_order_id: rzp_order_id,
-        amount_paise: row.total_paise,
-        currency: "INR",
-        name: state.config.store_name.clone(),
-        description: format!("Order {}", row.order_number),
-        prefill: Prefill {
-            name: row.customer_name.clone(),
-            email: row.customer_email.clone(),
-            contact: row.customer_phone.clone(),
-        },
-        notes: CheckoutNotes {
-            order_number: row.order_number.clone(),
-        },
-        payment_expires_at: row.payment_expires_at,
-        test_mode: row.is_test,
+/// Map a settlement to the answer for the storefront (pay / verify).
+fn settled_answer(outcome: SettleOutcome) -> Option<AppError> {
+    match outcome {
+        SettleOutcome::LateRefunded => Some(ORDER_EXPIRED),
+        SettleOutcome::NotPayableRefunded => Some(ORDER_NOT_PAYABLE),
+        _ => None,
     }
 }
 
-/// POST /orders/{orderNumber}/pay — create (once) or reuse the Razorpay order.
+/// POST /orders/{orderNumber}/pay — create (once) or fetch the Cashfree order
+/// and hand its payment session to the storefront.
 ///
-/// Race handling (two tabs / double click): the order is checked under its row
-/// lock, the lock is released, the Razorpay order is created WITHOUT holding
-/// any lock, and the id is attached with a guarded
-/// `UPDATE … WHERE razorpay_order_id IS NULL`. The loser of a race uses the
-/// winner's id; its own Razorpay order is never shown to anyone and simply
-/// lapses (no money can move on it).
+/// The Cashfree order id is deterministic per order, so races (two tabs,
+/// double click, a lost create response) all converge on ONE Cashfree order:
+/// the id is attached with a guarded `UPDATE … WHERE gateway_order_id IS NULL`
+/// (no lock is held across the HTTP calls), and a create that finds the id
+/// taken (409) fetches the existing order instead.
 async fn pay(
     State(state): State<AppState>,
     Path(order_number): Path<String>,
@@ -420,97 +415,135 @@ async fn pay(
     tx.commit().await?;
     payability(&row, window_open)?;
 
-    if let Some(existing) = row.razorpay_order_id.clone() {
-        return Ok(no_store(pay_response(&state, &row, existing)));
-    }
-
-    let created = state
-        .razorpay
-        .create_order(row.total_paise, row.id, &row.order_number)
-        .await?;
-    if !signature::is_order_id(&created.id)
-        || created.amount != row.total_paise
-        || created.currency != "INR"
-    {
-        tracing::error!(order_number = %row.order_number, "razorpay order response does not match the request");
+    let attached_before = row.gateway_order_id.is_some();
+    let gid = row
+        .gateway_order_id
+        .clone()
+        .unwrap_or_else(|| cashfree::gateway_order_id(&row.order_number, row.id));
+    if !signature::is_gateway_order_id(&gid) {
+        tracing::error!(order_number = %row.order_number, "stored gateway order id is malformed");
         return Err(AppError::PaymentGateway);
     }
-
-    if repo::payments::attach_razorpay_order(&state.db, row.id, &created.id).await? {
-        tracing::info!(order_number = %row.order_number, razorpay_order_id = %created.id, "razorpay order created");
-        return Ok(no_store(pay_response(&state, &row, created.id)));
+    if !attached_before && !repo::payments::attach_gateway_order(&state.db, row.id, &gid).await? {
+        // A concurrent request attached it first, or the order stopped being payable.
+        let now = repo::orders::find(&state.db, &OrderRef::Id(row.id))
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let window_open = repo::payments::payment_window_open(&state.db, row.id).await?;
+        payability(&now, window_open)?;
+        if now.gateway_order_id.as_deref() != Some(gid.as_str()) {
+            tracing::error!(order_number = %row.order_number, "a different gateway order id is attached");
+            return Err(AppError::PaymentGateway);
+        }
     }
 
-    // Lost a race, or the order stopped being payable meanwhile.
-    let now = repo::orders::find(&state.db, &OrderRef::Id(row.id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let window_open = repo::payments::payment_window_open(&state.db, row.id).await?;
-    payability(&now, window_open)?;
-    match now.razorpay_order_id.clone() {
-        Some(winner) => Ok(no_store(pay_response(&state, &now, winner))),
-        None => Err(AppError::PaymentGateway),
+    let cf = service::ensure_gateway_order(&state, &row, &gid, attached_before).await?;
+    match cf.order_status.as_str() {
+        "ACTIVE" => {}
+        "PAID" => {
+            // Paid but not settled here yet (verify/webhook still on the way).
+            let s = service::settle_order(&state, row.id, Source::Pay).await?;
+            return Err(match s.outcome {
+                SettleOutcome::Pending | SettleOutcome::NotPaid => AppError::PaymentGateway,
+                other => settled_answer(other).unwrap_or(ORDER_ALREADY_PAID),
+            });
+        }
+        status => {
+            tracing::warn!(order_number = %row.order_number, cf_status = status, "cashfree order is not payable");
+            return Err(AppError::PaymentGateway);
+        }
+    }
+    let Some(session) = cf
+        .payment_session_id
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SESSION_ID_LEN && s.is_ascii())
+    else {
+        tracing::error!(order_number = %row.order_number, "cashfree order without a usable payment session");
+        return Err(AppError::PaymentGateway);
+    };
+    Ok(no_store(PayResponse {
+        gateway: GATEWAY,
+        payment_session_id: session,
+        gateway_order_id: gid,
+        amount_paise: row.total_paise,
+        currency: "INR",
+        mode: state.config.cashfree_env.as_str(),
+        payment_expires_at: row.payment_expires_at,
+        test_mode: row.is_test,
+    }))
+}
+
+/// `{}` (or no body at all). Any other JSON is refused: the client has nothing
+/// to tell us — the outcome is read from Cashfree.
+fn check_verify_body(body: &[u8]) -> AppResult<()> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(m)) if m.is_empty() => Ok(()),
+        _ => Err(AppError::Validation("request body must be {}")),
     }
 }
 
-/// POST /orders/{orderNumber}/pay/verify — Checkout `handler` callback.
+/// POST /orders/{orderNumber}/pay/verify — after checkout (and while polling):
+/// re-read the order's payments from Cashfree and settle a successful one.
+/// Idempotent; safe to call repeatedly.
 async fn verify(
     State(state): State<AppState>,
     Path(order_number): Path<String>,
     headers: HeaderMap,
-    ApiJson(body): ApiJson<VerifyRequest>,
+    body: Bytes,
 ) -> Result<Response, PayError> {
     let row = load_guest_order(&state, &order_number, &headers).await?;
     require_payments_enabled(&state)?;
+    check_verify_body(&body)?;
 
-    if !signature::is_order_id(&body.razorpay_order_id)
-        || !signature::is_payment_id(&body.razorpay_payment_id)
-    {
-        return Err(PayError::VerificationFailed);
-    }
-    let key_secret = state.config.razorpay_key_secret.expose_secret().as_bytes();
-    if !signature::verify_checkout(
-        key_secret,
-        &body.razorpay_order_id,
-        &body.razorpay_payment_id,
-        &body.razorpay_signature,
-    ) {
-        tracing::warn!(order_number = %row.order_number, "checkout signature mismatch");
-        return Err(PayError::VerificationFailed);
-    }
-    if row.razorpay_order_id.as_deref() != Some(body.razorpay_order_id.as_str()) {
-        tracing::warn!(order_number = %row.order_number, "checkout razorpay order id does not belong to this order");
-        return Err(PayError::VerificationFailed);
-    }
-    // Idempotent fast path: already settled with exactly this payment.
-    if row.razorpay_payment_id.as_deref() == Some(body.razorpay_payment_id.as_str()) {
+    // Fast path: a payment is already booked on the order.
+    if row.gateway_payment_id.is_some() {
+        if row.status == "cancelled" {
+            // Paid too late / after cancellation and refunded.
+            return Err(if service::cancelled_by_expiry(&row) {
+                ORDER_EXPIRED
+            } else {
+                ORDER_NOT_PAYABLE
+            }
+            .into());
+        }
         return Ok(no_store(guest_view(&state, row).await?));
     }
+    if row.payment_method != METHOD_CASHFREE {
+        return Err(ORDER_NOT_PAYABLE.into());
+    }
+    if row.gateway_order_id.is_none() {
+        // Checkout never started: nothing to look up at Cashfree.
+        let window_open = repo::payments::payment_window_open(&state.db, row.id).await?;
+        payability(&row, window_open)?;
+        return Err(PayError::NotCompleted);
+    }
 
-    match service::settle_payment(
-        &state,
-        &body.razorpay_order_id,
-        &body.razorpay_payment_id,
-        Source::Checkout,
-    )
-    .await
-    {
+    match service::settle_order(&state, row.id, Source::Checkout).await {
         Ok(s) => match s.outcome {
-            SettleOutcome::Paid | SettleOutcome::AlreadyPaid | SettleOutcome::DuplicateRefunded => {
+            SettleOutcome::Paid | SettleOutcome::AlreadyPaid | SettleOutcome::DuplicatePayment => {
                 Ok(no_store(reload_guest_view(&state, s.order_id).await?))
             }
-            SettleOutcome::LateRefunded => Err(ORDER_EXPIRED.into()),
-            SettleOutcome::NotPayableRefunded => Err(ORDER_NOT_PAYABLE.into()),
-            SettleOutcome::NotCaptured => Err(PayError::VerificationFailed),
+            SettleOutcome::Pending => Err(PAYMENT_PENDING.into()),
+            SettleOutcome::NotPaid => {
+                // Nothing paid: say why it cannot be retried, if it cannot.
+                let now = repo::orders::find(&state.db, &OrderRef::Id(row.id))
+                    .await?
+                    .ok_or(AppError::NotFound)?;
+                let window_open = repo::payments::payment_window_open(&state.db, row.id).await?;
+                payability(&now, window_open)?;
+                Err(PayError::NotCompleted)
+            }
+            other => Err(settled_answer(other).unwrap_or(ORDER_NOT_PAYABLE).into()),
         },
-        Err(SettleError::Mismatch(_) | SettleError::UnknownOrder) => {
-            Err(PayError::VerificationFailed)
-        }
+        Err(SettleError::Mismatch(_)) => Err(PayError::VerificationFailed),
+        Err(SettleError::UnknownOrder) => Err(AppError::NotFound.into()),
         Err(e) => Err(PayError::App(e.into())),
     }
 }
 
-/// POST /webhooks/razorpay
+/// POST /webhooks/cashfree
 async fn webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -520,34 +553,34 @@ async fn webhook(
     if !state.config.payments_enabled {
         return Err(AppError::NotFound);
     }
-    let signature_ok = headers
-        .get(WEBHOOK_SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|sig| {
-            signature::verify_webhook(
-                state
-                    .config
-                    .razorpay_webhook_secret
-                    .expose_secret()
-                    .as_bytes(),
-                &body,
-                sig.trim(),
-            )
-        });
+    let header = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(v), None) => v.to_str().ok().map(str::trim),
+            _ => None,
+        }
+    };
+    let signature_ok = match (
+        header(WEBHOOK_TIMESTAMP_HEADER),
+        header(WEBHOOK_SIGNATURE_HEADER),
+    ) {
+        (Some(ts), Some(sig)) => signature::verify_webhook(
+            state.config.cashfree_secret_key.expose_secret().as_bytes(),
+            ts,
+            &body,
+            sig,
+        ),
+        _ => false,
+    };
     if !signature_ok {
         tracing::warn!(
             body_len = body.len(),
-            "razorpay webhook with missing or invalid signature"
+            "cashfree webhook with missing or invalid signature"
         );
         return Err(AppError::Validation("invalid webhook signature"));
     }
 
-    let event_id = service::event_id(
-        headers
-            .get(WEBHOOK_EVENT_ID_HEADER)
-            .and_then(|v| v.to_str().ok()),
-        &body,
-    );
+    let event_id = service::event_id(&body);
     service::handle_webhook(&state, &event_id, &body).await?;
     Ok(no_store(json!({ "status": "ok" })))
 }
@@ -555,6 +588,17 @@ async fn webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_body_must_be_empty() {
+        assert!(check_verify_body(b"").is_ok());
+        assert!(check_verify_body(b"  \n").is_ok());
+        assert!(check_verify_body(b"{}").is_ok());
+        assert!(check_verify_body(b" { } ").is_ok());
+        assert!(check_verify_body(br#"{"paid":true}"#).is_err());
+        assert!(check_verify_body(b"[]").is_err());
+        assert!(check_verify_body(b"nope").is_err());
+    }
 
     #[test]
     fn order_number_format() {

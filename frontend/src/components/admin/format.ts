@@ -179,7 +179,8 @@ export const PAYMENT_STATUS_META: Record<PaymentStatus, { label: string; classNa
 };
 
 export const PAYMENT_METHOD_LABEL: Record<PaymentMethod, string> = {
-  razorpay: 'Razorpay (online)',
+  cashfree: 'Online (Cashfree)',
+  razorpay: 'Online (Razorpay — legacy)',
   pay_later: 'Pay later',
   upi: 'UPI',
   card: 'Card',
@@ -211,7 +212,7 @@ const INSTRUMENT_LABEL: Record<string, string> = {
   netbanking: 'Net banking',
   wallet: 'Wallet',
   emi: 'EMI',
-  paylater: 'Pay later (Razorpay)',
+  paylater: 'Pay later (BNPL)',
   bank_transfer: 'Bank transfer',
 };
 
@@ -220,17 +221,27 @@ export function instrumentLabel(instrument: string | null | undefined): string |
   return INSTRUMENT_LABEL[instrument] ?? instrument.replace(/_/g, ' ');
 }
 
-/** "Razorpay · UPI" or "Bank transfer". */
+/** Methods settled by a payment gateway (refunds go through the gateway, never recorded by hand). */
+export const isOnlinePaymentMethod = (method: PaymentMethod | string | null | undefined) =>
+  method === 'cashfree' || method === 'razorpay';
+
+/** Short gateway names for "gateway · instrument" summaries (tables are narrow). */
+const GATEWAY_SHORT_LABEL: Partial<Record<PaymentMethod, string>> = {
+  cashfree: 'Cashfree',
+  razorpay: 'Razorpay (legacy)',
+};
+
+/** "Cashfree · UPI", "Online (Cashfree)" or "Bank transfer". */
 export function paymentMethodSummary(p: { method: PaymentMethod; instrument: string | null }): string {
   const method = PAYMENT_METHOD_LABEL[p.method] ?? p.method;
   const inst = instrumentLabel(p.instrument);
-  return p.method === 'razorpay' ? (inst ? `Razorpay · ${inst}` : 'Razorpay') : method;
+  const gateway = GATEWAY_SHORT_LABEL[p.method];
+  return gateway && inst ? `${gateway} · ${inst}` : method;
 }
 
-export const razorpayPaymentUrl = (paymentId: string) =>
-  `https://dashboard.razorpay.com/app/payments/${encodeURIComponent(paymentId)}`;
-export const razorpayOrderUrl = (orderId: string) =>
-  `https://dashboard.razorpay.com/app/orders/${encodeURIComponent(orderId)}`;
+/** Where to look up a gateway id (Cashfree has no stable public deep links, so we name the dashboard). */
+export const gatewayDashboardName = (method: PaymentMethod | string | null | undefined) =>
+  method === 'razorpay' ? 'Razorpay Dashboard' : 'Cashfree Merchant Dashboard';
 
 /** Remaining refundable amount in rupees (2-dp safe). */
 export function refundableAmount(order: { totalAmount: number; payment: { amountRefunded: number } }): number {

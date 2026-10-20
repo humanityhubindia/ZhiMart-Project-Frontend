@@ -120,7 +120,7 @@ pub fn whatsapp_link(phone: &str) -> String {
 }
 
 /// Human-readable payment state derived from the order's payment fields
-/// (admin "record payment", Razorpay capture and refunds all land there).
+/// (admin "record payment", Cashfree settlement and refunds all land there).
 pub fn payment_status_label(order: &Order) -> &'static str {
     let p = &order.payment;
     match p.status.as_str() {
@@ -154,6 +154,7 @@ pub fn amount_refunded_paise(order: &Order) -> i64 {
 
 fn method_label(method: &str) -> &str {
     match method {
+        "cashfree" => "Cashfree (online)",
         "razorpay" => "Razorpay (online)",
         "pay_later" => "Pay later",
         "upi" => "UPI",
@@ -165,7 +166,7 @@ fn method_label(method: &str) -> &str {
     }
 }
 
-/// `UPI · Ref UTR123`, `Razorpay (online) · upi · pay_Abc123`, `Pay later`.
+/// `UPI · Ref UTR123`, `Cashfree (online) · upi · 5114910253538`, `Pay later`.
 pub fn payment_details(order: &Order) -> String {
     let p = &order.payment;
     let mut parts = vec![method_label(&p.method).to_owned()];
@@ -180,7 +181,7 @@ pub fn payment_details(order: &Order) -> String {
     {
         parts.push(format!("Ref {reference}"));
     }
-    if let Some(id) = p.razorpay_payment_id.as_deref() {
+    if let Some(id) = p.gateway_payment_id.as_deref() {
         parts.push(id.to_owned());
     }
     parts.join(" · ")
@@ -361,8 +362,8 @@ mod tests {
                 paid_at: None,
                 refunded_at: None,
                 instrument: None,
-                razorpay_order_id: None,
-                razorpay_payment_id: None,
+                gateway_order_id: None,
+                gateway_payment_id: None,
                 amount_refunded: 0,
                 attention: None,
             },
@@ -482,16 +483,26 @@ mod tests {
         assert_eq!(amount_refunded_paise(&o), 57_600, "manual refund = full");
 
         o.payment = Payment {
-            method: "razorpay".into(),
+            method: "cashfree".into(),
             status: "pending".into(),
             instrument: Some("upi".into()),
-            razorpay_payment_id: Some("pay_ABC123".into()),
+            gateway_payment_id: Some("5114910253538".into()),
             reference: None,
             ..o.payment.clone()
         };
         o.status = "pending_payment".into();
         assert_eq!(payment_status_label(&o), "Awaiting payment");
-        assert_eq!(payment_details(&o), "Razorpay (online) · upi · pay_ABC123");
+        assert_eq!(
+            payment_details(&o),
+            "Cashfree (online) · upi · 5114910253538"
+        );
+        let mut legacy = o.clone();
+        legacy.payment.method = "razorpay".into();
+        legacy.payment.gateway_payment_id = Some("pay_ABC123".into());
+        assert_eq!(
+            payment_details(&legacy),
+            "Razorpay (online) · upi · pay_ABC123"
+        );
 
         o.status = "cancelled".into();
         o.cancel_reason = Some("Payment not completed".into());

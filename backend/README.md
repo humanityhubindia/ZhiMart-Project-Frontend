@@ -3,7 +3,7 @@
 Rust (axum + hyper + sqlx/PostgreSQL) API for Zhi-Mart. It serves three things:
 
 - **Public storefront:** the product catalog, plus guest checkout that reserves stock and
-  takes payment online through Razorpay.
+  takes payment online through Cashfree Payments.
 - **Admin console:** products, inventory, orders, payments and a dashboard.
 - **Admin login:** password, then a 6-digit code emailed through AWS SES, then a
   short-lived JWT access token plus a rotating HttpOnly refresh cookie. Every session
@@ -13,7 +13,7 @@ The endpoints, the error format and the token and cookie rules are in
 **[API.md](API.md)**:
 - [Admin Auth API](API.md#admin-auth-api-v1)
 - [Catalog, Inventory & Orders API](API.md#catalog-inventory--orders-api-v1)
-- [Payments (Razorpay) & Guest Orders](API.md#payments-razorpay--guest-orders-v1)
+- [Payments (Cashfree) & Guest Orders](API.md#payments-cashfree--guest-orders-v1)
 - [Payment switch & admin order notifications](API.md#payment-switch--admin-order-notifications-v1)
 
 ## How it fits together
@@ -31,12 +31,12 @@ browser ──HTTPS──► CDN / WAF ──► load balancer / reverse proxy (
                             ├─ /api/v1/orders      guest checkout (stock reservation),
                             │                      pay / verify / status (X-Order-Token)
                             ├─ /api/v1/storefront/config
-                            ├─ /api/v1/webhooks/razorpay   (HMAC-signed, not IP-limited)
+                            ├─ /api/v1/webhooks/cashfree   (HMAC-signed, not IP-limited)
                             ├─ /api/v1/admin/*     products, inventory, orders,
                             │                      payments, dashboard, sync (Bearer)
                             └─ /health/live, /health/ready
                                         │
-                    PostgreSQL     AWS SES (OTP email)     Razorpay API
+                    PostgreSQL     AWS SES (OTP email)     Cashfree PG API
 ```
 
 - **Login** (`POST /auth/login`): checks the password with Argon2id. Failed attempts
@@ -55,7 +55,8 @@ browser ──HTTPS──► CDN / WAF ──► load balancer / reverse proxy (
   - Every ~5 s: send queued admin "new order" emails from the outbox.
   - Every ~5 s (only with `GOOGLE_SHEETS_ENABLED=true`): write new or changed orders
     to the Google Sheet (see "Google Sheets order sync").
-  - Every ~30 s: cancel unpaid orders past their payment window and release their stock.
+  - Every ~30 s: cancel unpaid orders past their payment window and release their stock
+    (first asking Cashfree whether any of them was paid after all).
   - Every ~10 minutes: delete expired challenges, tokens, sessions and old audit rows.
   - Every 60 s: remove idle entries from the rate limiters.
 
@@ -70,8 +71,8 @@ cp .env.example .env
 # Fill in JWT_SECRET and OTP_PEPPER (two different values):
 openssl rand -base64 48
 openssl rand -base64 48
-# Online payments are OFF by default (RAZORPAY_ENABLED=false: pay-later orders), so no
-# Razorpay keys are needed. To try Razorpay locally, see "Payments (Razorpay)".
+# Online payments are OFF by default (CASHFREE_ENABLED=false: pay-later orders), so no
+# Cashfree keys are needed. To try Cashfree (sandbox) locally, see "Payments (Cashfree)".
 # New-order emails to admins are printed to the log (EMAIL_PROVIDER=log).
 
 cargo run -- migrate                                            # optional: `serve` runs migrations itself
@@ -212,7 +213,8 @@ and logs the SES error. The code itself is never logged.
       - "rate limiter tracking an unusually large number of clients"
       - SES send failures
       - "payment expiry: sweep failed"
-      - Razorpay gateway errors (`payment_gateway_error`)
+      - Cashfree gateway errors (`payment_gateway_error`, "cashfree unavailable",
+        "cashfree rejected our API credentials")
       - non-null `payment_attention`
       - "order notification permanently failed" / "send failed"
 - [ ] Create the first admin with `create-admin`, then sign in once to confirm SES
@@ -225,12 +227,8 @@ and logs the SES error. The code itself is never logged.
       - A configuration set with SNS bounce/complaint notifications is configured.
       - Place a test order: confirm the admin email arrives, and that the customer's
         tracking link opens the order page.
-- [ ] Razorpay (only once `RAZORPAY_ENABLED=true`):
-      - Live keys and webhook secret are in the secret manager.
-      - The **Live** webhook is configured with all six events.
-      - Automatic capture is enabled.
-      - `PAYMENT_TEST_MODE=false` (or, temporarily, `true` for a real ₹1 smoke test that
-        you then refund).
+- [ ] Cashfree (only once `CASHFREE_ENABLED=true`): work through the go-live checklist
+      in "Payments (Cashfree)" below.
 
 ### Rate limits at a glance
 
@@ -243,8 +241,9 @@ All limits are per client IP; IPv6 is grouped by /64.
 | `POST /auth/refresh`, `GET /auth/me` | 60/min, burst 20 | |
 | `POST /auth/logout` | global limit only | **Exempt** from the session limit: a rate-limited logout would leave the session alive while the user believes they signed out. |
 | `POST /orders` | 6/min, burst 3 | See below. |
-| `GET /storefront/config`, `GET /orders/{n}`, `POST /orders/{n}/pay`, `POST /orders/{n}/pay/verify` | 40/min, burst 15 | Covers the order status page polling every ~3 s, plus a second tab. A valid `X-Order-Token` is also required. |
-| `POST /webhooks/razorpay` | 600/min, burst 100 (safety valve only) | **Outside** the global limit: the HMAC signature is its authentication, and Razorpay delivers in bursts from a few IPs. Body limit, timeout and load shedding still apply. |
+| `GET /storefront/config`, `GET /orders/{n}`, `POST /orders/{n}/pay` | 40/min, burst 15 | Covers the order status page polling every ~3 s, plus a second tab. A valid `X-Order-Token` is also required. |
+| `POST /orders/{n}/pay/verify` | 30/min, burst 10 (own budget) | The storefront polls it every ~5 s for up to 2 min while a payment is pending; two tabs (or two customers behind one carrier NAT) fit. Each call costs one Cashfree API read. |
+| `POST /webhooks/cashfree` | 600/min, burst 100 (safety valve only) | **Outside** the global limit: the HMAC signature is its authentication, and Cashfree delivers in bursts from a few IPs. Body limit, timeout and load shedding still apply. |
 | `/health/*` | none | Never load-shed. Readiness is cached and costs at most one DB ping per second. |
 
 One admin with a few dashboard tabs fits comfortably in the global limit. Each visible tab
@@ -295,7 +294,7 @@ Bulk fake orders from many IPs are an edge/WAF problem. Watch the dashboard's
 
 ## Order payments: pay-later vs online
 
-`RAZORPAY_ENABLED` decides how customers pay.
+`CASHFREE_ENABLED` decides how customers pay.
 
 **`false` (the default, and the recommended launch setting): pay-later**
 - `POST /orders` creates the order as `pending_pack`, with payment `pay_later` /
@@ -308,9 +307,9 @@ Bulk fake orders from many IPs are an edge/WAF problem. Watch the dashboard's
   UTR).
 - If the customer never pays, **Cancel** the order: this restocks every line.
 - The payment and webhook endpoints answer `409 online_payments_disabled` and `404`.
-- No Razorpay keys are needed.
+- No Cashfree keys are needed.
 
-**`true`: Razorpay**
+**`true`: Cashfree**
 - Online payment, with a stock reservation and an expiry window. Described below.
 - The admin email is sent only once a payment is **confirmed**, so abandoned checkouts
   never email anyone.
@@ -355,7 +354,7 @@ makes delivery always free; `DELIVERY_FEE_RUPEES=0` does too.
 - The server decides the fee; the client never sends it. It is stored per order in
   `orders.delivery_fee_paise` (orders placed before this feature have 0).
 - `orders.total_paise` = sum of the line totals + `delivery_fee_paise`. It stays the
-  payable amount, so the Razorpay amount, payment verification, refunds (a full refund
+  payable amount, so the Cashfree order amount, payment verification, refunds (a full refund
   returns the delivery charge too), manual "mark paid" and dashboard revenue all include
   delivery. Top-product revenue is line totals, so it excludes it.
 - Order JSON carries `subtotal`, `deliveryFee` and `totalAmount`; `GET /products` and
@@ -378,7 +377,7 @@ The store delivers within Tamil Nadu only, so the storefront no longer asks for 
 checkout.
 
 - **When it is sent**: through the same outbox, at the same moment as the admin email:
-  on placement for pay-later orders, or on payment confirmation with Razorpay. Exactly
+  on placement for pay-later orders, or on payment confirmation with Cashfree. Exactly
   one email per order.
 - **Recipient**: only the order's customer, one recipient per message. If the address
   is missing or invalid, the outbox row is marked `failed` with reason
@@ -430,7 +429,8 @@ checkout.
   - Customer details: name, tap-to-call phone, email, address with pincode, notes.
   - An item table with MRP, savings, subtotal, delivery ("₹500" or "FREE"),
     "Tax (GST): ₹0" and the amount payable.
-  - Payment method and status, plus the Razorpay payment id when paid online.
+  - Payment method and status, plus the Cashfree payment id when paid online
+    ("Razorpay payment id" for orders paid before the switch).
   - An **Open admin console** button pointing at `PUBLIC_SITE_URL/?page=admin` (only
     when that is set).
   - Every customer value is HTML-escaped.
@@ -474,7 +474,7 @@ Customer Notes · Test Order (Yes/No) · Last Updated (IST)
 
 - Database triggers on `orders` put the order into `sheet_sync_queue` in the same
   transaction as the change. This covers every code path: checkout, admin edits,
-  Razorpay verify and webhook, refunds, and the expiry sweep. Payment and refund state
+  Cashfree verify and webhook, refunds, and the expiry sweep. Payment and refund state
   lives on `orders`, so one trigger covers it. Checkout does one extra `INSERT` and no
   network call.
 - A background worker (every replica, ~5 s, `SKIP LOCKED` plus a 120 s lease) takes up
@@ -606,50 +606,69 @@ Manual edits to a synced row are overwritten the next time that order changes. K
 own notes in extra columns to the right of **Last Updated (IST)**; the sync writes only
 columns A–AA.
 
-## Payments (Razorpay)
+## Payments (Cashfree)
 
-Everything in this section applies only when `RAZORPAY_ENABLED=true`. Launch with
-`false`, then turn it on once the keys, the webhook and automatic capture are configured.
+Everything in this section applies only when `CASHFREE_ENABLED=true`. Launch with
+`false`, then turn it on once the keys, the webhook and the return-URL domain are set up
+in the Cashfree Merchant Dashboard. (Razorpay was the previous gateway: its code is gone,
+`RAZORPAY_*` variables are ignored with a startup warning, and orders paid through it keep
+`payment_method = 'razorpay'` and are refunded from the Razorpay Dashboard.)
 
-Customers check out as guests and pay online through Razorpay Checkout (UPI, cards,
-netbanking, wallets). **The browser never decides that an order is paid.** An order
-becomes paid only in one of two ways:
-- The server verifies the Checkout signature **and** confirms the payment with the
-  Razorpay API: order id, amount, currency and status must all match.
-- The server receives a signature-verified webhook.
+Customers check out as guests and pay through Cashfree Checkout (UPI, cards, net banking,
+wallets, EMI, pay-later), opened in a modal by the Cashfree JS SDK v3. **The browser never
+decides that an order is paid.** An order becomes paid only after the server reads the
+payment back from the Cashfree API (`GET /orders/{id}/payments`): status `SUCCESS`, same
+Cashfree order, currency INR and exactly the order's amount. Three things trigger that
+read, all running the same idempotent code under the order's row lock:
+- `POST /orders/{n}/pay/verify`, which the storefront calls after checkout (and every
+  ~5 s while a payment is `PENDING`, e.g. a UPI collect request);
+- the signed webhook (`PAYMENT_SUCCESS_WEBHOOK`), for customers who close the tab;
+- the expiry sweep, just before it would cancel an unpaid order.
 
-Both paths run the same idempotent code. The endpoint details are in
-[API.md](API.md#payments-razorpay--guest-orders-v1).
+The endpoint details are in [API.md](API.md#payments-cashfree--guest-orders-v1). The
+client pins Cashfree API version `2023-08-01`.
 
-### 1. API keys
-Dashboard → **Account & Settings → API Keys** → Generate Key.
-- **Test keys** (`rzp_test_…`): the dashboard's Test Mode toggle. No real money moves; use
-  Razorpay's test cards and UPI ids.
-- **Live keys** (`rzp_live_…`): available after KYC and activation. Real payments.
+### 1. API keys (sandbox and production)
+Merchant Dashboard → **Developers → API Keys**. The dashboard has a Test/Live switch;
+each side has its own App ID and Secret Key.
+- **Sandbox** (`CASHFREE_ENV=sandbox`, the default): test credentials against
+  `https://sandbox.cashfree.com/pg`. No real money moves; use Cashfree's test UPI ids and
+  cards.
+- **Production** (`CASHFREE_ENV=production`): live credentials (after KYC and
+  activation) against `https://api.cashfree.com/pg`. Real payments.
 
-Set `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`. The secret is shown only once: store it
-in your secret manager. The key id is public, because the browser needs it to open
-Checkout.
+Set `CASHFREE_APP_ID` and `CASHFREE_SECRET_KEY` from the same side as `CASHFREE_ENV`
+(mixing them gives 401 "cashfree rejected our API credentials" in the logs). The secret
+key also verifies webhook signatures: keep it in the secret manager, never in the
+frontend. The storefront only learns the SDK mode (`cashfreeMode`) and, per order, a
+`paymentSessionId`.
 
 ### 2. Webhook
-Dashboard → **Account & Settings → Webhooks** → Add New Webhook. Configure it
-separately for Test and Live mode.
-- **URL:** `https://<api-host>/api/v1/webhooks/razorpay`
-- **Secret:** the value of `RAZORPAY_WEBHOOK_SECRET`. Generate it with
-  `openssl rand -hex 32`, and make it different from the key secret.
-- **Active events:** `payment.authorized`, `payment.captured`, `payment.failed`,
-  `order.paid`, `refund.processed`, `refund.failed`.
+Merchant Dashboard → **Developers → Webhooks** → Add Webhook Endpoint (configure Test and
+Live separately).
+- **URL:** `https://api.zhimart.in/api/v1/webhooks/cashfree`
+- **Webhook version:** `2023-08-01` (the version this server parses; later versions are
+  tolerated, but keep them in step).
+- **Events:** Payment — success, failed, user dropped; Refund — refund status and
+  auto-refund status.
 
-Webhooks are the safety net for customers who close the tab after paying. Without them,
-those orders depend on the expiry sweep plus manual reconciliation. Every delivery is
-stored in `payment_events` and deduplicated by event id, so redeliveries are harmless.
-A bad signature gets 400; Razorpay retries any non-2xx response.
+There is no separate webhook secret: Cashfree signs every delivery with your **secret
+key** (`x-webhook-signature` = base64 HMAC-SHA256 of `x-webhook-timestamp` + raw body).
+A missing or bad signature gets 400. Every verified delivery is stored (redacted) in
+`payment_events`, deduplicated by a hash of its body, and treated only as a trigger:
+the server re-reads the payment/refund from the API before changing anything, and answers
+5xx when Cashfree cannot be reached (or does not show the success yet), so Cashfree
+retries. Optionally set `CASHFREE_NOTIFY_URL` to the same URL to have it sent per order
+as `order_meta.notify_url` as well; the dashboard endpoint is enough.
 
-### 3. Automatic capture
-Dashboard → **Account & Settings → Payment Capture** → set **automatic capture**. Use
-an expiry that is at least `PAYMENT_EXPIRY_MINUTES`. As a backstop, the server also
-captures an `authorized` payment when it verifies it, but automatic capture prevents
-payments from sitting uncaptured and being auto-refunded by Razorpay.
+### 3. Return URL domain whitelisting
+Cashfree only redirects back to whitelisted domains. Merchant Dashboard → **Developers →
+Whitelisting** (or ask Cashfree support): whitelist **`zhimart.in`** for the Payment
+Gateway in production (sandbox does not require it). The return URL is
+`{PUBLIC_SITE_URL}/?page=order&order=ZM-…&cf_return=1`, so `PUBLIC_SITE_URL` is required
+whenever `CASHFREE_ENABLED=true` in production. It deliberately carries no order token
+(Cashfree would see it): the storefront keeps the token in `sessionStorage` for the
+redirect flows.
 
 ### 4. Test mode: ₹1 per unit
 `PAYMENT_TEST_MODE=true` charges **₹1 per unit for every product**. This is enforced
@@ -658,69 +677,97 @@ server-side:
 - The delivery charge (when it applies) is ₹1 too; `pricing.deliveryFee` reports 1.
 - Orders are flagged `isTest` and excluded from revenue on the dashboard.
 
-| Keys | `PAYMENT_TEST_MODE` | Result |
+| `CASHFREE_ENV` | `PAYMENT_TEST_MODE` | Result |
 |---|---|---|
-| `rzp_test_…` | `true` or `false` | Simulated payments only; no money moves. |
-| `rzp_live_…` | `true` | **Real ₹1 payments**: an end-to-end check of the live setup with real UPI or cards. Refund them from the admin console afterwards. |
-| `rzp_live_…` | `false` | Production: real prices. |
+| `sandbox` | `true` or `false` | Simulated payments only; no money moves. |
+| `production` | `true` | **Real ₹1 payments**: an end-to-end check of the live setup with real UPI or cards. Refund them from the admin console afterwards. |
+| `production` | `false` | Production: real prices. |
 
-With `APP_ENV=production`, `RAZORPAY_ENABLED=true` and test mode off, the server refuses
-to start unless the keys are live. At startup it logs a warning when test mode is on, and whether the keys are
-test or live. Secrets are never logged.
+With `APP_ENV=production`, `CASHFREE_ENABLED=true` and test mode off, the server refuses
+to start unless `CASHFREE_ENV=production`; `CASHFREE_API_BASE` cannot be overridden in
+production. At startup it logs whether Cashfree runs in sandbox or production and warns
+when test mode is on. Secrets are never logged.
 
 ### 5. Order and payment lifecycle
 ```
 POST /orders ─► pending_payment  (stock reserved, payment window = PAYMENT_EXPIRY_MINUTES)
-   POST /orders/{n}/pay ─► Razorpay order created once, reused on retries ─► Checkout
-   verify endpoint or webhook ─► payment confirmed ─► pending_pack ─► dispatched ─► … ─► delivered
-   window passes unpaid ─► expiry sweep (every ~30 s) ─► cancelled, stock released
+   POST /orders/{n}/pay ─► Cashfree order "{orderNumber}_{12 hex}" created once
+                           (deterministic id: retries / two tabs reuse it) ─► SDK checkout
+   verify (polled) / webhook / sweep ─► API shows SUCCESS ─► pending_pack ─► dispatched ─► …
+   window passes unpaid ─► sweep asks Cashfree, then cancels, stock released
    payment arrives after expiry ─► stock re-reserved if still available ("revived"),
                                    otherwise refunded automatically
 ```
-The storefront passes the guest order token in `X-Order-Token`. The token lives in the
-URL fragment, so it never reaches server logs or `Referer` headers.
+The Cashfree order is given at least 16 minutes before it expires (`order_expiry_time`),
+even when less is left of our window; a payment after our window takes the late-payment
+path above. Cashfree accepts one successful payment per order and auto-refunds any
+duplicate: the server flags such an order (`payment_attention`) and records Cashfree's
+auto-refund from its webhook. Do **not** enable payment surcharges (convenience fees) in
+the dashboard: the paid amount must equal the order total exactly.
 
 ### 6. Refunds
-In the admin console, open the order and choose **Refund** (full or partial). This calls
-the Razorpay refund API, with each request idempotent. The result arrives through the
-`refund.processed` / `refund.failed` webhooks and is shown in the order's payment
-events. Manual "mark paid/refunded" actions are blocked for Razorpay orders. If an
+In the admin console, open the order and choose **Refund** (full or partial). Cashfree
+refunds are per order (`POST /orders/{id}/refunds`, speed STANDARD). The refund is written
+to the `refunds` ledger first; its id is Cashfree's `refund_id` and the idempotency key, so
+it can never be sent twice. An ambiguous answer (timeout) is reconciled with
+`GET /orders/{id}/refunds/{refund_id}`; until it is known the amount stays reserved, and a
+refund Cashfree never received is marked failed after 15 minutes. Refund status webhooks
+complete pending refunds; refunds made in the dashboard are recorded too. Manual "mark
+paid/refunded" actions are blocked for online (Cashfree or legacy Razorpay) orders. If an
 automatic refund of a late payment fails, the order gets `payment_attention` and is
-highlighted in the console: refund it from the Razorpay dashboard, then note it on the
-order.
+highlighted in the console: refund it from the Cashfree Merchant Dashboard.
 
 ### 7. Reconciliation
-- Daily: compare the Razorpay dashboard's captured payments and settlements with paid
-  orders:
+- Daily: compare the Cashfree dashboard's successful transactions and settlements with
+  paid orders:
   ```sql
-  SELECT order_number, razorpay_order_id, razorpay_payment_id, total_paise,
+  SELECT order_number, gateway_order_id, gateway_payment_id, total_paise,
          amount_refunded_paise, paid_at
   FROM orders
-  WHERE payment_method = 'razorpay' AND NOT is_test AND paid_at >= now() - interval '1 day'
+  WHERE payment_method = 'cashfree' AND NOT is_test AND paid_at >= now() - interval '1 day'
   ORDER BY paid_at;
   ```
+  `gateway_order_id` is the "Order ID" in the Cashfree dashboard; `gateway_payment_id`
+  is its "Transaction ID" (`cf_payment_id`).
 - Orders that need a human:
   `SELECT order_number, payment_attention FROM orders WHERE payment_attention IS NOT NULL;`
 - Webhook health. Events that were received but never processed point to a processing
-  error; check the logs by event id:
+  error or an outage; Cashfree retries them:
   `SELECT id, event, received_at, outcome FROM payment_events WHERE processed_at IS NULL ORDER BY received_at DESC LIMIT 50;`
 - Refunds not yet confirmed:
   `SELECT * FROM refunds WHERE status = 'pending' AND created_at < now() - interval '1 hour';`
-- A payment in Razorpay with no matching paid order usually means the customer paid
-  after expiry. That case is revived or auto-refunded; look up its
-  `razorpay_payment_id` in `payment_events`.
+- A payment in Cashfree with no matching paid order usually means the customer paid
+  after expiry. That case is revived or auto-refunded; look up the order by
+  `gateway_order_id` in `payment_events`.
 
-### 8. Frontend Content-Security-Policy
-If the storefront sends a CSP, it must allow Razorpay Checkout. Check this against
-Razorpay's current documentation:
+### 8. Go-live checklist
+- [ ] Production App ID and Secret Key in the secret manager; `CASHFREE_ENV=production`,
+      `CASHFREE_ENABLED=true`, no `CASHFREE_API_BASE`, no leftover `RAZORPAY_*`.
+- [ ] `PUBLIC_SITE_URL=https://zhimart.in`, and `zhimart.in` whitelisted for the Payment
+      Gateway in the Cashfree dashboard.
+- [ ] Live webhook `https://api.zhimart.in/api/v1/webhooks/cashfree`, version
+      `2023-08-01`, payment and refund events enabled; use the dashboard's test
+      delivery and check the API logs for "webhook processed" (a 400 means the secret
+      key does not match the environment).
+- [ ] No payment surcharge / convenience fee configured.
+- [ ] The storefront CSP allows the Cashfree SDK (section 9).
+- [ ] Smoke test with `PAYMENT_TEST_MODE=true`: a real ₹1 UPI payment → order
+      `pending_pack`, admin email sent; refund it from the admin console → refund
+      `processed` after the refund webhook. Then set `PAYMENT_TEST_MODE=false`.
+- [ ] Alerting on `payment_gateway_error`, "cashfree unavailable", "cashfree rejected our
+      API credentials" and non-null `payment_attention`.
+
+### 9. Frontend Content-Security-Policy
+If the storefront sends a CSP, it must allow the Cashfree JS SDK and its checkout frames.
+Check this against Cashfree's current documentation:
 ```
-script-src  'self' https://checkout.razorpay.com;
-frame-src   https://api.razorpay.com https://*.razorpay.com;
-connect-src 'self' https://api.razorpay.com https://lumberjack.razorpay.com;
-img-src     'self' data: https://pub-a53dd3b873894b56842f46208c52fcd1.r2.dev;
+script-src  'self' https://sdk.cashfree.com;
+frame-src   https://sdk.cashfree.com https://*.cashfree.com;
+connect-src 'self' https://*.cashfree.com;
+img-src     'self' data: https://*.cashfree.com https://pub-a53dd3b873894b56842f46208c52fcd1.r2.dev;
 ```
-`img-src` covers the product photos on Cloudflare R2 (`R2_PUBLIC_URL`). Swap the host if
-the bucket moves to a custom domain.
+`img-src` also covers the product photos on Cloudflare R2 (`R2_PUBLIC_URL`). Swap the host
+if the bucket moves to a custom domain.
 The API's own `Content-Security-Policy: default-src 'none'` applies only to JSON
 responses and does not affect the storefront.
 

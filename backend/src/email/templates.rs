@@ -225,6 +225,7 @@ fn ist(ts: DateTime<Utc>) -> String {
 
 fn payment_method_label(method: &str) -> String {
     match method {
+        "cashfree" => "Online (Cashfree)".to_owned(),
         "razorpay" => "Online (Razorpay)".to_owned(),
         "pay_later" => "Pay later — collect payment manually".to_owned(),
         "upi" => "UPI".to_owned(),
@@ -297,11 +298,17 @@ pub fn order_notification(
     let placed_at = ist(order.created_at);
     let method = payment_method_label(&order.payment.method);
     let pay_status = sanitize_text(&order.payment.status);
-    let rzp_payment = order
+    let gateway_payment = order
         .payment
-        .razorpay_payment_id
+        .gateway_payment_id
         .as_deref()
         .map(sanitize_text);
+    // Orders paid before the switch to Cashfree carry Razorpay ids.
+    let gateway_payment_label = if order.payment.method == "razorpay" {
+        "Razorpay payment id"
+    } else {
+        "Cashfree payment id"
+    };
     let instrument = order.payment.instrument.as_deref().map(sanitize_text);
     let email = c
         .email
@@ -373,8 +380,8 @@ pub fn order_notification(
     if let Some(i) = &instrument {
         let _ = writeln!(text, "  Instrument: {i}");
     }
-    if let Some(p) = &rzp_payment {
-        let _ = writeln!(text, "  Razorpay payment id: {p}");
+    if let Some(p) = &gateway_payment {
+        let _ = writeln!(text, "  {gateway_payment_label}: {p}");
     }
     if let Some(url) = &console_url {
         let _ = writeln!(text, "\nOpen admin console: {url}");
@@ -436,8 +443,8 @@ pub fn order_notification(
     if let Some(i) = &instrument {
         prow("Instrument", i);
     }
-    if let Some(p) = &rzp_payment {
-        prow("Razorpay payment id", p);
+    if let Some(p) = &gateway_payment {
+        prow(gateway_payment_label, p);
     }
 
     let test_banner = if order.is_test {
@@ -917,14 +924,14 @@ mod tests {
             total_amount: 12_395_150,
             status: "pending_pack".into(),
             payment: Payment {
-                method: "razorpay".into(),
+                method: "cashfree".into(),
                 status: "paid".into(),
                 reference: None,
                 paid_at: Some(at()),
                 refunded_at: None,
                 instrument: Some("upi".into()),
-                razorpay_order_id: Some("order_ABC123".into()),
-                razorpay_payment_id: Some("pay_XYZ789".into()),
+                gateway_order_id: Some("ZM-261013-1001_8f3a2b1c9d0e".into()),
+                gateway_payment_id: Some("5114910253538".into()),
                 amount_refunded: 0,
                 attention: None,
             },
@@ -977,8 +984,9 @@ mod tests {
             assert!(body.contains("₹1,23,951.50"), "payable");
             assert!(body.contains("₹165"), "unit price");
             assert!(body.contains("₹495"), "line total");
-            assert!(body.contains("pay_XYZ789"));
-            assert!(body.contains("Online (Razorpay)"));
+            assert!(body.contains("5114910253538"));
+            assert!(body.contains("Cashfree payment id"));
+            assert!(body.contains("Online (Cashfree)"));
             assert!(body.contains("Bulk price (₹10,000+ order)"), "pricing tier");
             assert!(body.contains("626123"));
             assert!(body.contains("Subtotal") && body.contains("₹1,23,951.50"));
@@ -1068,7 +1076,7 @@ mod tests {
         let mut later = order(false);
         later.payment.method = "pay_later".into();
         later.payment.status = "pending".into();
-        later.payment.razorpay_payment_id = None;
+        later.payment.gateway_payment_id = None;
         later.payment.instrument = None;
         later.customer.email = None;
         let e = order_notification(
@@ -1078,9 +1086,20 @@ mod tests {
             1_000_000,
         );
         assert!(e.text.contains("Pay later"));
-        assert!(!e.text.contains("Razorpay payment id"));
+        assert!(!e.text.contains("payment id"));
         assert!(!e.html.contains("javascript:"), "non-http site URL ignored");
         assert!(!e.text.contains("Email:"));
+
+        // Orders paid through Razorpay before the switch keep their labels.
+        let mut legacy = order(false);
+        legacy.payment.method = "razorpay".into();
+        legacy.payment.gateway_payment_id = Some("pay_XYZ789".into());
+        let e = order_notification(&legacy, vec!["a@b.co".into()], None, 1_000_000);
+        for body in [&e.html, &e.text] {
+            assert!(body.contains("Online (Razorpay)"));
+            assert!(body.contains("Razorpay payment id"));
+            assert!(body.contains("pay_XYZ789"));
+        }
     }
 
     // ---- customer confirmation ----

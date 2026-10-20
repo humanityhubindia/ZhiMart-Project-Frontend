@@ -6,7 +6,7 @@
 //! `order_placed` movements are written by a single statement. Prices, names and
 //! pack info always come from the locked rows, never from the client.
 //!
-//! With online payments enabled (`RAZORPAY_ENABLED`), new orders start in
+//! With online payments enabled (`CASHFREE_ENABLED`), new orders start in
 //! `pending_payment` with their stock reserved until `payment_expires_at` (see
 //! `repo::orders::expire_unpaid_orders`); the admin notification is queued by
 //! the payment service once payment is confirmed. With online payments off,

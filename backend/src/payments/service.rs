@@ -1,52 +1,73 @@
-//! Payment service shared by the guest endpoints, the webhook and the admin
-//! refund endpoint.
+//! Payment service shared by the guest endpoints, the webhook, the expiry
+//! sweep and the admin refund endpoint (Cashfree).
 //!
 //! Invariants:
-//! * An order becomes paid only through [`settle_payment`], after the payment
-//!   has been confirmed by Razorpay itself — fetched from the API (checkout
-//!   verify path) or taken from a signature-verified webhook — with matching
-//!   order id, amount and currency, and status `captured` (an `authorized`
-//!   payment is captured first). A checkout signature alone is never enough.
+//! * An order becomes paid only through [`settle_order`], after the payment
+//!   has been read back from the Cashfree API itself
+//!   (`GET /orders/{id}/payments`) with status `SUCCESS`, matching Cashfree
+//!   order id, currency `INR` and amount (exactly `total_paise`). Nothing the
+//!   browser says and nothing a webhook carries is trusted on its own: verify
+//!   calls, webhooks and the sweep are all just TRIGGERS for that re-read.
+//!   There is no capture step (we never use pre-auth; a `SUCCESS` payment is
+//!   captured).
 //! * Every state change happens in one transaction holding the order row lock,
-//!   so the checkout verify call and the webhook for the same payment (or any
-//!   redelivery/double click) produce exactly one transition; the others observe
-//!   the result and return "already paid".
-//! * HTTP calls to Razorpay are never made while holding a row lock. Refunds
+//!   so a verify poll, the webhook and the sweep for the same payment (or any
+//!   redelivery/double click) produce exactly one transition and one admin
+//!   email; the others observe the result and report "already paid".
+//! * HTTP calls to Cashfree are never made while holding a row lock. Refunds
 //!   are written to the `refunds` ledger (status `pending`) and committed
-//!   BEFORE the API call, then completed; the refund row id is the Razorpay
-//!   `receipt`/idempotency key.
+//!   BEFORE the API call, then completed; the refund row id is Cashfree's
+//!   `refund_id` and the idempotency key. Cashfree refunds are per ORDER (they
+//!   apply to the order's successful payment), and our Cashfree order id is
+//!   deterministic per order, so an order has at most one Cashfree order.
+//! * A second successful payment on the same Cashfree order is NOT refunded by
+//!   us (a refund call would hit the order's settled payment): Cashfree
+//!   auto-refunds duplicate payments; we flag the order for attention and
+//!   record Cashfree's auto-refund when its webhook arrives.
+//! * Late payments (order already cancelled by the expiry sweep) revive the
+//!   order when the stock is still there, else are refunded automatically; a
+//!   payment for an order cancelled by an admin is refunded automatically.
 
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
     payments::{
-        razorpay::{GatewayError, RzpPayment, RzpRefund},
+        cashfree::{self, CfOrder, CfPayment, CfRefund, GatewayError, NewGatewayOrder},
         signature,
     },
     repo::{
         self,
-        orders::{EXPIRY_CANCEL_REASON, OrderRef, OrderRow, ReviveOutcome},
+        orders::{EXPIRY_CANCEL_REASON, METHOD_CASHFREE, OrderRef, OrderRow, ReviveOutcome},
         payments::{NewEvent, NewRefund, REFUND_FAILED, REFUND_PENDING, REFUND_PROCESSED},
     },
     state::AppState,
 };
 
-/// Where a payment confirmation came from.
-#[derive(Debug, Clone)]
+/// What triggered a settlement (logging only: every source re-reads the API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Checkout handler (`/pay/verify`): the payment is fetched from the API.
+    /// `POST /pay/verify` (the storefront after checkout, and its polling).
     Checkout,
-    /// Signature-verified webhook: the signed payment entity is authoritative.
-    Webhook(Box<RzpPayment>),
+    /// `POST /pay` found the Cashfree order already `PAID`.
+    Pay,
+    /// A signature-verified webhook.
+    Webhook,
+    /// The expiry sweep, before cancelling an unpaid order.
+    Sweep,
 }
 
 impl Source {
-    fn label(&self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Source::Checkout => "checkout",
-            Source::Webhook(_) => "webhook",
+            Source::Pay => "pay",
+            Source::Webhook => "webhook",
+            Source::Sweep => "sweep",
         }
     }
 }
@@ -57,14 +78,17 @@ pub enum SettleOutcome {
     Paid,
     /// The order was already paid with this payment (idempotent no-op).
     AlreadyPaid,
-    /// The order was already paid with a different payment; this one is refunded.
-    DuplicateRefunded,
+    /// The order was already paid with a different payment; flagged for
+    /// attention (Cashfree auto-refunds duplicate payments on an order).
+    DuplicatePayment,
     /// Paid after the order expired and stock is gone; refunded (`order_expired`).
     LateRefunded,
     /// Order cancelled (not by expiry) or otherwise not payable; refunded.
     NotPayableRefunded,
-    /// Payment is not captured/authorized (failed, created, refunded): nothing changed.
-    NotCaptured,
+    /// No successful payment yet, but one is `PENDING` at Cashfree.
+    Pending,
+    /// No successful or pending payment: nothing changed.
+    NotPaid,
 }
 
 impl SettleOutcome {
@@ -72,20 +96,21 @@ impl SettleOutcome {
         match self {
             SettleOutcome::Paid => "paid",
             SettleOutcome::AlreadyPaid => "already_paid",
-            SettleOutcome::DuplicateRefunded => "duplicate_payment_refunded",
+            SettleOutcome::DuplicatePayment => "duplicate_payment",
             SettleOutcome::LateRefunded => "late_payment_refunded",
             SettleOutcome::NotPayableRefunded => "not_payable_refunded",
-            SettleOutcome::NotCaptured => "payment_not_captured",
+            SettleOutcome::Pending => "payment_pending",
+            SettleOutcome::NotPaid => "payment_not_completed",
         }
     }
 }
 
 #[derive(Debug)]
 pub enum SettleError {
-    /// The Razorpay order is not one of ours.
+    /// Not one of our Cashfree orders (unknown, or a legacy Razorpay order).
     UnknownOrder,
-    /// Malformed ids, or the payment does not match the order (order id,
-    /// amount, currency). Treat as unpaid.
+    /// The successful payment (or the Cashfree order) does not match our
+    /// order (order id, amount, currency). Treated as unpaid.
     Mismatch(&'static str),
     Gateway(GatewayError),
     Db(sqlx::Error),
@@ -109,120 +134,155 @@ pub struct Settlement {
     pub outcome: SettleOutcome,
 }
 
-/// Instrument as reported by Razorpay (`upi`, `card`, …), if it looks sane.
-fn instrument(p: &RzpPayment) -> Option<String> {
-    p.method
-        .as_deref()
-        .filter(|m| {
-            !m.is_empty()
-                && m.len() <= 30
-                && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        })
-        .map(str::to_ascii_lowercase)
+/// A successful payment that matches the order it claims to pay.
+#[derive(Debug, Clone)]
+struct ConfirmedPayment {
+    id: String,
+    amount_paise: i64,
+    instrument: Option<String>,
 }
 
-/// Check a Razorpay payment against the order it claims to pay.
+/// Check a Cashfree payment against our order.
 fn check_payment(
-    p: &RzpPayment,
-    payment_id: &str,
-    rzp_order_id: &str,
+    p: &CfPayment,
+    gateway_order_id: &str,
     total_paise: i64,
-) -> Result<(), SettleError> {
-    if p.id != payment_id {
-        return Err(SettleError::Mismatch("payment id mismatch"));
+) -> Result<ConfirmedPayment, &'static str> {
+    if !signature::is_gateway_payment_id(&p.cf_payment_id) {
+        return Err("malformed payment id");
     }
-    if p.order_id.as_deref() != Some(rzp_order_id) {
-        return Err(SettleError::Mismatch("order id mismatch"));
+    if p.order_id.as_deref().is_some_and(|o| o != gateway_order_id) {
+        return Err("order id mismatch");
     }
-    if p.currency != "INR" {
-        return Err(SettleError::Mismatch("currency mismatch"));
+    if p.payment_currency != "INR" {
+        return Err("currency mismatch");
     }
-    if p.amount != total_paise {
-        return Err(SettleError::Mismatch("amount mismatch"));
+    if p.amount_paise() != Some(total_paise) {
+        return Err("amount mismatch");
     }
-    Ok(())
+    Ok(ConfirmedPayment {
+        id: p.cf_payment_id.clone(),
+        amount_paise: total_paise,
+        instrument: cashfree::instrument(p.payment_group.as_deref()),
+    })
 }
 
-/// Settle a Razorpay payment against our order. Idempotent and safe to call
-/// concurrently for the same payment from the verify endpoint and the webhook.
-pub async fn settle_payment(
+/// Check a Cashfree order entity (create/fetch response) against our order.
+fn check_gateway_order(o: &CfOrder, gateway_order_id: &str, total_paise: i64) -> bool {
+    o.order_id == gateway_order_id
+        && o.order_currency == "INR"
+        && cashfree::rupees_to_paise(o.order_amount) == Some(total_paise)
+}
+
+/// Set `payment_attention` unless it already says this (re-reads, polls and
+/// webhook redeliveries must not bump the order's version every time).
+async fn attention_once(state: &AppState, row: &OrderRow, note: &str) -> Result<(), sqlx::Error> {
+    if row.payment_attention.as_deref() == Some(note) {
+        return Ok(());
+    }
+    repo::payments::set_attention(&state.db, row.id, note).await
+}
+
+/// Reconcile our order with Cashfree: read the order's payments from the API
+/// and settle a matching `SUCCESS` payment. Idempotent; safe to call
+/// concurrently (verify polling, webhook, sweep) for the same order.
+pub async fn settle_order(
     state: &AppState,
-    rzp_order_id: &str,
-    payment_id: &str,
+    order_id: Uuid,
     source: Source,
 ) -> Result<Settlement, SettleError> {
-    if !signature::is_order_id(rzp_order_id) || !signature::is_payment_id(payment_id) {
-        return Err(SettleError::Mismatch("malformed razorpay id"));
-    }
-    let order_id = repo::payments::order_id_by_razorpay_order(&state.db, rzp_order_id)
-        .await?
-        .ok_or(SettleError::UnknownOrder)?;
     let order = repo::orders::find(&state.db, &OrderRef::Id(order_id))
         .await?
         .ok_or(SettleError::UnknownOrder)?;
+    if order.payment_method != METHOD_CASHFREE {
+        return Err(SettleError::UnknownOrder);
+    }
+    let done = |outcome| Ok(Settlement { order_id, outcome });
+    let Some(gid) = order.gateway_order_id.clone() else {
+        return done(SettleOutcome::NotPaid);
+    };
+    if !signature::is_gateway_order_id(&gid) {
+        return Err(SettleError::Mismatch("malformed gateway order id"));
+    }
     let source_label = source.label();
 
-    let payment = match source {
-        Source::Checkout => match state.razorpay.fetch_payment(payment_id).await {
-            Ok(p) => p,
-            // Razorpay does not know this payment id (400/404): the browser
-            // relayed something that is not a real payment.
-            Err(GatewayError::Rejected {
-                status: 400 | 404, ..
-            }) => {
-                return Err(SettleError::Mismatch("payment not found at Razorpay"));
-            }
-            Err(e) => return Err(e.into()),
-        },
-        Source::Webhook(p) => *p,
+    let payments = match state.cashfree.fetch_order_payments(&gid).await {
+        Ok(p) => p,
+        // The Cashfree order was never created (pay failed half-way): no payments.
+        Err(e) if e.is_not_found() => Vec::new(),
+        Err(e) => return Err(e.into()),
     };
-    if let Err(e) = check_payment(&payment, payment_id, rzp_order_id, order.total_paise) {
-        if let SettleError::Mismatch(why) = &e {
-            tracing::error!(
-                order_number = %order.order_number, payment_id, source = source_label, reason = why,
-                "razorpay payment does not match the order"
-            );
-            if matches!(payment.status.as_str(), "captured" | "authorized")
-                && payment.id == payment_id
-            {
-                let note = format!(
-                    "Payment {payment_id} does not match this order ({why}); review it in the Razorpay Dashboard"
-                );
-                repo::payments::set_attention(&state.db, order_id, &note).await?;
-            }
-        }
-        return Err(e);
+    let successes: Vec<&CfPayment> = payments.iter().filter(|p| p.is_success()).collect();
+    if successes.is_empty() {
+        let outcome = if order.gateway_payment_id.is_some() {
+            SettleOutcome::AlreadyPaid
+        } else if payments.iter().any(CfPayment::is_pending) {
+            SettleOutcome::Pending
+        } else {
+            SettleOutcome::NotPaid
+        };
+        return done(outcome);
     }
 
-    let payment = match payment.status.as_str() {
-        "captured" => payment,
-        "authorized" => {
-            let captured = capture(state, &payment).await?;
-            check_payment(&captured, payment_id, rzp_order_id, order.total_paise)?;
-            captured
+    // The payment already recorded on the order first, then the oldest match.
+    let mut ordered = successes.clone();
+    ordered.sort_by_key(|p| Some(p.cf_payment_id.as_str()) != order.gateway_payment_id.as_deref());
+    let mut confirmed: Option<ConfirmedPayment> = None;
+    let mut first_mismatch: Option<(&str, &'static str)> = None;
+    for p in &ordered {
+        match check_payment(p, &gid, order.total_paise) {
+            Ok(c) if confirmed.is_none() => confirmed = Some(c),
+            Ok(_) => {}
+            Err(why) => {
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((p.cf_payment_id.as_str(), why));
+                }
+            }
         }
-        _ => {
-            let outcome = if order.razorpay_payment_id.as_deref() == Some(payment_id) {
-                SettleOutcome::AlreadyPaid
-            } else {
-                SettleOutcome::NotCaptured
-            };
-            return Ok(Settlement { order_id, outcome });
-        }
+    }
+    let Some(payment) = confirmed else {
+        let (pid, why) = first_mismatch.unwrap_or(("?", "no matching payment"));
+        tracing::error!(
+            order_number = %order.order_number, payment_id = pid, source = source_label, reason = why,
+            "cashfree payment does not match the order"
+        );
+        let pid: String = pid
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(64)
+            .collect();
+        let note = format!(
+            "Payment {pid} does not match this order ({why}); review it in the Cashfree Merchant Dashboard"
+        );
+        attention_once(state, &order, &note).await?;
+        return Err(SettleError::Mismatch(why));
     };
 
-    let (outcome, refund) = settle_locked(state, order_id, &payment).await?;
+    let (outcome, refund) = settle_locked(state, order_id, &gid, &payment).await?;
     match outcome {
         SettleOutcome::Paid => tracing::info!(
-            order_number = %order.order_number, payment_id, source = source_label, "order paid"
+            order_number = %order.order_number, payment_id = %payment.id, source = source_label, "order paid"
         ),
         SettleOutcome::AlreadyPaid => tracing::debug!(
-            order_number = %order.order_number, payment_id, source = source_label, "payment already settled"
+            order_number = %order.order_number, payment_id = %payment.id, source = source_label, "payment already settled"
         ),
         other => tracing::warn!(
-            order_number = %order.order_number, payment_id, source = source_label, outcome = other.as_str(),
-            "payment cannot be applied to the order; refunding"
+            order_number = %order.order_number, payment_id = %payment.id, source = source_label,
+            outcome = other.as_str(), "payment cannot be applied to the order"
         ),
+    }
+
+    // Further SUCCESS payments on the same Cashfree order are duplicates.
+    let settled_id = repo::orders::find(&state.db, &OrderRef::Id(order_id))
+        .await?
+        .and_then(|r| r.gateway_payment_id);
+    let duplicates: Vec<&str> = successes
+        .iter()
+        .map(|p| p.cf_payment_id.as_str())
+        .filter(|id| Some(*id) != settled_id.as_deref() && signature::is_gateway_payment_id(id))
+        .collect();
+    if let Some(dup) = duplicates.first() {
+        flag_duplicate(state, order_id, dup).await?;
     }
 
     if let Some(job) = refund {
@@ -230,43 +290,53 @@ pub async fn settle_payment(
         // the outcome for the caller is the same either way.
         if let Err(e) = execute_refund(state, &job, true).await {
             tracing::error!(
-                order_number = %job.order_number, payment_id, error = %e.summary(), "automatic refund did not complete"
+                order_number = %job.order_number, payment_id = %payment.id, error = %e.summary(),
+                "automatic refund did not complete"
             );
         }
     }
-    Ok(Settlement { order_id, outcome })
+    let outcome = if outcome == SettleOutcome::AlreadyPaid && !duplicates.is_empty() {
+        SettleOutcome::DuplicatePayment
+    } else {
+        outcome
+    };
+    done(outcome)
 }
 
-/// Capture an `authorized` payment. If the capture call fails (e.g. Razorpay
-/// auto-captured it meanwhile), re-fetch and accept it if it is now captured.
-async fn capture(state: &AppState, p: &RzpPayment) -> Result<RzpPayment, SettleError> {
-    match state.razorpay.capture_payment(&p.id, p.amount).await {
-        Ok(c) if c.status == "captured" => Ok(c),
-        Ok(_) | Err(_) => {
-            let again = state.razorpay.fetch_payment(&p.id).await?;
-            if again.status == "captured" {
-                Ok(again)
-            } else {
-                tracing::warn!(payment_id = %p.id, status = %again.status, "payment could not be captured");
-                Err(SettleError::Gateway(GatewayError::Unavailable))
-            }
-        }
+async fn flag_duplicate(state: &AppState, order_id: Uuid, dup: &str) -> Result<(), sqlx::Error> {
+    let Some(row) = repo::orders::find(&state.db, &OrderRef::Id(order_id)).await? else {
+        return Ok(());
+    };
+    if row
+        .payment_attention
+        .as_deref()
+        .is_some_and(|a| a.contains(dup))
+    {
+        return Ok(());
     }
+    tracing::warn!(order_number = %row.order_number, payment_id = dup, "duplicate successful payment on one order");
+    let note = format!(
+        "Duplicate payment {dup} received (order already paid); Cashfree refunds duplicate payments automatically: confirm it in the Cashfree Merchant Dashboard"
+    );
+    repo::payments::set_attention(&state.db, order_id, &note).await
 }
 
-/// A refund recorded in the ledger, to be sent to Razorpay.
+/// A refund recorded in the ledger, to be sent to Cashfree.
 #[derive(Debug, Clone)]
 pub struct RefundJob {
     pub refund_id: Uuid,
     pub order_id: Uuid,
     pub order_number: String,
+    /// Cashfree refunds are per order: `POST /orders/{gateway_order_id}/refunds`.
+    pub gateway_order_id: String,
+    /// The order's settled payment (ledger bookkeeping).
     pub payment_id: String,
     pub amount_paise: i64,
 }
 
-/// Queue the admin "new order" email inside the transaction that moves the
-/// order to paid (only the transaction holding the row lock that performs the
-/// transition gets here; the outbox's unique index makes it idempotent anyway).
+/// Queue the order emails inside the transaction that moves the order to paid
+/// (only the transaction holding the row lock that performs the transition
+/// gets here; the outbox's unique index makes it idempotent anyway).
 async fn enqueue_order_notification(
     state: &AppState,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -280,10 +350,11 @@ async fn enqueue_order_notification(
 async fn settle_locked(
     state: &AppState,
     order_id: Uuid,
-    payment: &RzpPayment,
+    gateway_order_id: &str,
+    payment: &ConfirmedPayment,
 ) -> Result<(SettleOutcome, Option<RefundJob>), SettleError> {
     let pid = payment.id.as_str();
-    let instrument = instrument(payment);
+    let instrument = payment.instrument.as_deref();
     let mut tx = state.db.begin().await?;
     repo::admins::set_lock_timeout(&mut tx).await?;
     let row = repo::orders::find_for_update(&mut tx, &OrderRef::Id(order_id))
@@ -291,20 +362,15 @@ async fn settle_locked(
         .ok_or(SettleError::UnknownOrder)?;
 
     let mut refund_reason: Option<&'static str> = None;
-    let outcome = if row.razorpay_payment_id.as_deref() == Some(pid) {
+    let outcome = if row.gateway_payment_id.as_deref() == Some(pid) {
         SettleOutcome::AlreadyPaid
-    } else if let Some(existing) = row.razorpay_payment_id.as_deref() {
-        let note = format!(
-            "Duplicate payment {pid} received (order already paid by {existing}); automatic refund issued"
-        );
-        repo::payments::set_attention(&mut *tx, order_id, &note).await?;
-        refund_reason =
-            Some("Automatic refund: duplicate payment for an order that was already paid");
-        SettleOutcome::DuplicateRefunded
+    } else if row.gateway_payment_id.is_some() {
+        // Caller flags it; Cashfree auto-refunds duplicates (see module docs).
+        SettleOutcome::DuplicatePayment
     } else if row.status == "pending_payment" {
         // Even if the window has just passed, the sweep has not released the
         // stock yet (the order would be `cancelled`), so the payment is honoured.
-        if !repo::payments::mark_paid(&mut tx, order_id, pid, instrument.as_deref()).await? {
+        if !repo::payments::mark_paid(&mut tx, order_id, pid, instrument).await? {
             return Err(SettleError::Db(sqlx::Error::RowNotFound));
         }
         enqueue_order_notification(state, &mut tx, order_id).await?;
@@ -312,8 +378,7 @@ async fn settle_locked(
     } else if row.status == "cancelled" {
         match repo::orders::revive_expired_order(&mut tx, order_id).await? {
             ReviveOutcome::Revived => {
-                if !repo::payments::mark_paid(&mut tx, order_id, pid, instrument.as_deref()).await?
-                {
+                if !repo::payments::mark_paid(&mut tx, order_id, pid, instrument).await? {
                     return Err(SettleError::Db(sqlx::Error::RowNotFound));
                 }
                 enqueue_order_notification(state, &mut tx, order_id).await?;
@@ -323,11 +388,7 @@ async fn settle_locked(
             ReviveOutcome::InsufficientStock => {
                 let note = "Payment received after the order expired and the stock was no longer available; automatic refund issued";
                 repo::payments::record_unfulfillable_payment(
-                    &mut tx,
-                    order_id,
-                    pid,
-                    instrument.as_deref(),
-                    note,
+                    &mut tx, order_id, pid, instrument, note,
                 )
                 .await?;
                 refund_reason = Some(
@@ -338,11 +399,7 @@ async fn settle_locked(
             ReviveOutcome::NotExpired => {
                 let note = "Payment received for a cancelled order; automatic refund issued";
                 repo::payments::record_unfulfillable_payment(
-                    &mut tx,
-                    order_id,
-                    pid,
-                    instrument.as_deref(),
-                    note,
+                    &mut tx, order_id, pid, instrument, note,
                 )
                 .await?;
                 refund_reason = Some("Automatic refund: payment received for a cancelled order");
@@ -366,7 +423,7 @@ async fn settle_locked(
     let mut job = None;
     if let Some(reason) = refund_reason {
         let reserved = repo::payments::refunds_reserved_total(&mut tx, pid).await?;
-        let amount = payment.amount - reserved;
+        let amount = payment.amount_paise - reserved;
         if amount > 0 {
             let refund_id = Uuid::now_v7();
             repo::payments::insert_refund(
@@ -374,7 +431,7 @@ async fn settle_locked(
                 &NewRefund {
                     id: refund_id,
                     order_id,
-                    razorpay_payment_id: pid,
+                    gateway_payment_id: pid,
                     amount_paise: amount,
                     reason,
                     initiated_by: None,
@@ -385,6 +442,7 @@ async fn settle_locked(
                 refund_id,
                 order_id,
                 order_number: row.order_number.clone(),
+                gateway_order_id: gateway_order_id.to_owned(),
                 payment_id: pid.to_owned(),
                 amount_paise: amount,
             });
@@ -394,26 +452,96 @@ async fn settle_locked(
     Ok((outcome, job))
 }
 
-/// Send a ledger refund to Razorpay and record the result.
+// ---------------------------------------------------------------------------
+// Starting a payment
+// ---------------------------------------------------------------------------
+
+/// Cashfree is given at least this long before its order expires, whatever is
+/// left of our window (it may refuse very short expiries). A payment after our
+/// window closes takes the late-payment path (revive or refund).
+const MIN_GATEWAY_ORDER_LIFETIME: chrono::Duration = chrono::Duration::minutes(16);
+
+/// Create (once) or fetch the Cashfree order for `row` under `gateway_order_id`.
 ///
-/// * accepted ⇒ refund id stored, order totals recomputed;
+/// `attached_before`: the id was already stored on the order, so the Cashfree
+/// order most likely exists (fetch first; 404 ⇒ create). Otherwise create
+/// first; 409 "already exists" (a lost response, a second tab) ⇒ fetch. The
+/// result is checked against our order (id, amount, currency).
+pub async fn ensure_gateway_order(
+    state: &AppState,
+    row: &OrderRow,
+    gateway_order_id: &str,
+    attached_before: bool,
+) -> Result<CfOrder, SettleError> {
+    let found = if attached_before {
+        match state.cashfree.fetch_order(gateway_order_id).await {
+            Ok(o) => Some(o),
+            Err(e) if e.is_not_found() => None,
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        None
+    };
+    let order = match found {
+        Some(o) => o,
+        None => {
+            let return_url = state.config.cashfree_return_url(&row.order_number);
+            let floor = Utc::now() + MIN_GATEWAY_ORDER_LIFETIME;
+            let expires_at = row.payment_expires_at.map_or(floor, |e| e.max(floor));
+            let req = NewGatewayOrder {
+                gateway_order_id,
+                order_id: row.id,
+                order_number: &row.order_number,
+                amount_paise: row.total_paise,
+                customer_name: &row.customer_name,
+                customer_phone: &row.customer_phone,
+                customer_email: row.customer_email.as_deref(),
+                return_url: &return_url,
+                notify_url: state.config.cashfree_notify_url.as_deref(),
+                expires_at,
+            };
+            match state.cashfree.create_order(&req).await {
+                Ok(o) => {
+                    tracing::info!(order_number = %row.order_number, gateway_order_id, "cashfree order created");
+                    o
+                }
+                Err(e) if e.is_conflict() => state.cashfree.fetch_order(gateway_order_id).await?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    if !check_gateway_order(&order, gateway_order_id, row.total_paise) {
+        tracing::error!(order_number = %row.order_number, gateway_order_id, "cashfree order does not match our order");
+        return Err(SettleError::Mismatch("gateway order does not match"));
+    }
+    Ok(order)
+}
+
+// ---------------------------------------------------------------------------
+// Refunds
+// ---------------------------------------------------------------------------
+
+/// Send a ledger refund to Cashfree and record the result.
+///
+/// * accepted ⇒ Cashfree refund id stored, order totals recomputed;
 /// * rejected (4xx) ⇒ refund `failed` with the reason;
-/// * no answer ⇒ reconcile by listing the payment's refunds; if still unknown
-///   the row stays `pending` (its amount stays reserved, so it can never be
-///   refunded twice) until a `refund.*` webhook or a later reconciliation.
+/// * no answer (or "already exists") ⇒ reconcile with
+///   `GET /orders/{id}/refunds/{refund_id}`; if still unknown the row stays
+///   `pending` (its amount stays reserved, so it can never be refunded twice)
+///   until a refund webhook or a later reconciliation.
 ///
 /// `automatic` refunds flag the order for attention when they fail.
 pub async fn execute_refund(
     state: &AppState,
     job: &RefundJob,
     automatic: bool,
-) -> Result<RzpRefund, GatewayError> {
+) -> Result<CfRefund, GatewayError> {
     let result = state
-        .razorpay
-        .refund_payment(
-            &job.payment_id,
-            job.amount_paise,
+        .cashfree
+        .create_refund(
+            &job.gateway_order_id,
             job.refund_id,
+            job.amount_paise,
             &job.order_number,
         )
         .await;
@@ -422,35 +550,33 @@ pub async fn execute_refund(
         Err(e) => e,
     };
 
-    match &err {
-        GatewayError::Rejected { .. } => {
-            let summary = err.summary();
-            if let Err(e) = repo::payments::fail_refund(&state.db, job.refund_id, &summary).await {
-                tracing::error!(refund_id = %job.refund_id, error = %e, "could not mark refund failed");
-            }
-            let note = format!(
-                "Automatic refund of payment {} failed; refund it manually",
-                job.payment_id
-            );
-            flag_or_bump(state, job, automatic.then_some(note.as_str())).await;
-            Err(err)
+    if matches!(err, GatewayError::Rejected { .. }) && !err.is_conflict() {
+        let summary = err.summary();
+        if let Err(e) = repo::payments::fail_refund(&state.db, job.refund_id, &summary).await {
+            tracing::error!(refund_id = %job.refund_id, error = %e, "could not mark refund failed");
         }
-        GatewayError::Unavailable => {
-            if let Ok(found) = reconcile_one(state, job).await {
-                return Ok(found);
-            }
-            let note = "Razorpay did not confirm this refund yet; awaiting confirmation";
-            if let Err(e) = repo::payments::note_refund(&state.db, job.refund_id, note).await {
-                tracing::error!(refund_id = %job.refund_id, error = %e, "could not annotate refund");
-            }
-            let note = format!(
-                "Automatic refund of payment {} is unconfirmed; check the Razorpay Dashboard",
-                job.payment_id
-            );
-            flag_or_bump(state, job, automatic.then_some(note.as_str())).await;
-            Err(err)
-        }
+        let note = format!(
+            "Automatic refund of payment {} failed; refund it from the Cashfree Merchant Dashboard",
+            job.payment_id
+        );
+        flag_or_bump(state, job, automatic.then_some(note.as_str())).await;
+        return Err(err);
     }
+
+    // Unavailable, or our refund id already exists at Cashfree.
+    if let Ok(found) = reconcile_one(state, job).await {
+        return Ok(found);
+    }
+    let note = "Cashfree did not confirm this refund yet; awaiting confirmation";
+    if let Err(e) = repo::payments::note_refund(&state.db, job.refund_id, note).await {
+        tracing::error!(refund_id = %job.refund_id, error = %e, "could not annotate refund");
+    }
+    let note = format!(
+        "Automatic refund of payment {} is unconfirmed; check the Cashfree Merchant Dashboard",
+        job.payment_id
+    );
+    flag_or_bump(state, job, automatic.then_some(note.as_str())).await;
+    Err(GatewayError::Unavailable)
 }
 
 /// After a refund failed or went unconfirmed: flag the order for attention
@@ -465,49 +591,54 @@ async fn flag_or_bump(state: &AppState, job: &RefundJob, attention: Option<&str>
     }
 }
 
-/// Look for our refund among the payment's refunds at Razorpay.
-async fn reconcile_one(state: &AppState, job: &RefundJob) -> Result<RzpRefund, GatewayError> {
-    let refunds = state
-        .razorpay
-        .fetch_payment_refunds(&job.payment_id)
+/// Look our refund up at Cashfree by our refund id.
+async fn reconcile_one(state: &AppState, job: &RefundJob) -> Result<CfRefund, GatewayError> {
+    let r = state
+        .cashfree
+        .fetch_refund(&job.gateway_order_id, &cashfree::refund_ref(job.refund_id))
         .await?;
-    match refunds
-        .into_iter()
-        .find(|r| r.our_refund_id() == Some(job.refund_id))
-    {
-        Some(r) => apply_gateway_refund(state, job, r).await,
-        None => Err(GatewayError::Unavailable),
-    }
+    apply_gateway_refund(state, job, r).await
 }
 
+/// Cashfree refund status → ledger status.
 fn refund_status(s: &str) -> &'static str {
     match s {
-        "processed" => REFUND_PROCESSED,
-        "failed" => REFUND_FAILED,
+        "SUCCESS" => REFUND_PROCESSED,
+        "CANCELLED" | "FAILED" | "REJECTED" => REFUND_FAILED,
         _ => REFUND_PENDING,
     }
 }
 
-/// Store a refund entity Razorpay returned for one of our ledger rows.
+/// Store a refund entity Cashfree returned for one of our ledger rows.
 async fn apply_gateway_refund(
     state: &AppState,
     job: &RefundJob,
-    r: RzpRefund,
-) -> Result<RzpRefund, GatewayError> {
-    if !signature::is_refund_id(&r.id)
-        || r.payment_id != job.payment_id
-        || r.amount != job.amount_paise
+    r: CfRefund,
+) -> Result<CfRefund, GatewayError> {
+    if !signature::is_gateway_refund_id(&r.cf_refund_id)
+        || r.our_refund_id() != Some(job.refund_id)
+        || r.order_id
+            .as_deref()
+            .is_some_and(|o| o != job.gateway_order_id)
+        || r.amount_paise() != Some(job.amount_paise)
     {
-        tracing::error!(refund_id = %job.refund_id, "razorpay refund response does not match the request");
+        tracing::error!(refund_id = %job.refund_id, "cashfree refund response does not match the request");
         return Err(GatewayError::Unavailable);
     }
-    let status = refund_status(&r.status);
-    let failure = (status == REFUND_FAILED).then_some("Razorpay reported the refund as failed");
+    let status = refund_status(&r.refund_status);
+    let failure = (status == REFUND_FAILED).then_some("Cashfree reported the refund as failed");
     let stored = async {
         let mut tx = state.db.begin().await?;
         repo::admins::set_lock_timeout(&mut tx).await?;
         repo::orders::find_for_update(&mut tx, &OrderRef::Id(job.order_id)).await?;
-        repo::payments::apply_refund_status(&mut tx, job.refund_id, &r.id, status, failure).await?;
+        repo::payments::apply_refund_status(
+            &mut tx,
+            job.refund_id,
+            &r.cf_refund_id,
+            status,
+            failure,
+        )
+        .await?;
         if !repo::payments::sync_refund_totals(&mut tx, job.order_id).await? {
             repo::payments::bump_version(&mut *tx, job.order_id).await?;
         }
@@ -515,32 +646,35 @@ async fn apply_gateway_refund(
     }
     .await;
     if let Err(e) = stored {
-        // Razorpay accepted the refund; the refund.processed webhook (which
-        // carries our id in `receipt`/`notes`) will complete the bookkeeping.
-        tracing::error!(refund_id = %job.refund_id, error = %e, "refund accepted by Razorpay but not recorded");
+        // Cashfree accepted the refund; the refund webhook (which carries our
+        // refund_id) or the next reconciliation completes the bookkeeping.
+        tracing::error!(refund_id = %job.refund_id, error = %e, "refund accepted by Cashfree but not recorded");
         return Err(GatewayError::Unavailable);
     }
     tracing::info!(
-        order_number = %job.order_number, refund_id = %job.refund_id, razorpay_refund_id = %r.id,
-        amount_paise = job.amount_paise, status, "refund accepted by Razorpay"
+        order_number = %job.order_number, refund_id = %job.refund_id, cf_refund_id = %r.cf_refund_id,
+        amount_paise = job.amount_paise, status, "refund accepted by Cashfree"
     );
     if status == REFUND_FAILED {
         return Err(GatewayError::Rejected {
             status: 200,
             code: "REFUND_FAILED".into(),
-            description: "Razorpay reported the refund as failed".into(),
+            message: "Cashfree reported the refund as failed".into(),
         });
     }
     Ok(r)
 }
 
 /// Before a new admin refund: resolve refunds whose outcome was never
-/// confirmed. Found at Razorpay ⇒ recorded; unknown to Razorpay for 15+
+/// confirmed. Found at Cashfree ⇒ recorded; unknown to Cashfree (404) for 15+
 /// minutes ⇒ marked failed (the request never arrived). Best effort.
 pub async fn reconcile_unconfirmed_refunds(state: &AppState, order: &OrderRow) {
-    if !state.config.payments_enabled {
+    if !state.config.payments_enabled || order.payment_method != METHOD_CASHFREE {
         return;
     }
+    let Some(gid) = order.gateway_order_id.clone() else {
+        return;
+    };
     let rows = match repo::payments::unconfirmed_refunds(&state.db, order.id).await {
         Ok(r) if !r.is_empty() => r,
         Ok(_) => return,
@@ -554,35 +688,93 @@ pub async fn reconcile_unconfirmed_refunds(state: &AppState, order: &OrderRow) {
             refund_id: row.id,
             order_id: order.id,
             order_number: order.order_number.clone(),
-            payment_id: row.razorpay_payment_id.clone(),
+            gateway_order_id: gid.clone(),
+            payment_id: row.gateway_payment_id.clone(),
             amount_paise: row.amount_paise,
         };
         match state
-            .razorpay
-            .fetch_payment_refunds(&row.razorpay_payment_id)
+            .cashfree
+            .fetch_refund(&gid, &cashfree::refund_ref(row.id))
             .await
         {
-            Ok(list) => match list.into_iter().find(|r| r.our_refund_id() == Some(row.id)) {
-                Some(r) => {
-                    let _ = apply_gateway_refund(state, &job, r).await;
-                }
-                None if row.stale => {
-                    repo::payments::fail_refund(
-                        &state.db,
-                        row.id,
-                        "Never reached Razorpay (reconciled)",
-                    )
-                    .await
-                    .unwrap_or_else(
-                        |e| tracing::warn!(error = %e, "could not mark stale refund failed"),
-                    );
-                    flag_or_bump(state, &job, None).await;
-                }
-                None => {}
-            },
+            Ok(r) => {
+                let _ = apply_gateway_refund(state, &job, r).await;
+            }
+            Err(e) if e.is_not_found() && row.stale => {
+                repo::payments::fail_refund(
+                    &state.db,
+                    row.id,
+                    "Never reached Cashfree (reconciled)",
+                )
+                .await
+                .unwrap_or_else(
+                    |e| tracing::warn!(error = %e, "could not mark stale refund failed"),
+                );
+                flag_or_bump(state, &job, None).await;
+            }
+            Err(e) if e.is_not_found() => {}
             Err(_) => return,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expiry sweep
+// ---------------------------------------------------------------------------
+
+/// What [`reconcile_expiring_orders`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReconcile {
+    pub checked: usize,
+    /// Orders that turned out to be paid (settled instead of cancelled).
+    pub paid: usize,
+    /// Cashfree was unavailable: the rest were not checked (the sweep cancels
+    /// them anyway; a late payment revives or refunds).
+    pub gateway_unavailable: bool,
+}
+
+/// Before the expiry sweep cancels unpaid orders: ask Cashfree whether any of
+/// them was actually paid (a webhook lost or delayed, a customer who closed
+/// the tab), and settle those instead. Best effort and bounded: at most
+/// `limit` orders and `budget` of wall time per call; never holds a row lock
+/// across an HTTP call (settlement takes its own lock afterwards).
+pub async fn reconcile_expiring_orders(
+    state: &AppState,
+    limit: i64,
+    budget: Duration,
+) -> SweepReconcile {
+    let mut run = SweepReconcile::default();
+    if !state.config.payments_enabled {
+        return run;
+    }
+    let ids = match repo::payments::expired_awaiting_gateway(&state.db, limit).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "payment expiry: could not list orders to reconcile");
+            return run;
+        }
+    };
+    let started = Instant::now();
+    for id in ids {
+        if started.elapsed() >= budget {
+            break;
+        }
+        run.checked += 1;
+        match settle_order(state, id, Source::Sweep).await {
+            Ok(s) if s.outcome == SettleOutcome::Paid => run.paid += 1,
+            Ok(_) | Err(SettleError::Mismatch(_) | SettleError::UnknownOrder) => {}
+            Err(SettleError::Gateway(GatewayError::Rejected { .. })) => {}
+            Err(SettleError::Gateway(GatewayError::Unavailable)) => {
+                run.gateway_unavailable = true;
+                break;
+            }
+            Err(SettleError::Db(e)) => {
+                tracing::warn!(error = %e, "payment expiry: reconcile failed");
+                break;
+            }
+        }
+    }
+    run
 }
 
 // ---------------------------------------------------------------------------
@@ -598,53 +790,114 @@ pub enum WebhookResult {
     Processed(String),
 }
 
-fn entity<T: serde::de::DeserializeOwned>(payload: &Value, key: &str) -> Option<T> {
-    payload
-        .get(key)?
-        .get("entity")
-        .and_then(|e| serde_json::from_value(e.clone()).ok())
-}
-
-/// Event id: Razorpay's `X-Razorpay-Event-Id` when it is well-formed, else a
-/// stable id derived from the body hash (so redeliveries still deduplicate).
-pub fn event_id(header: Option<&str>, body: &[u8]) -> String {
+/// Event id: `cf_` + sha256(raw body) hex. Cashfree redelivers the same body
+/// (re-signed with a new timestamp), so retries deduplicate.
+pub fn event_id(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    match header.map(str::trim) {
-        Some(h)
-            if (1..=100).contains(&h.len())
-                && h.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
-        {
-            h.to_owned()
-        }
-        _ => format!("body_{}", signature::hex_encode(&Sha256::digest(body))),
-    }
+    format!("cf_{}", signature::hex_encode(&Sha256::digest(body)))
 }
 
-/// Only ids, amounts and statuses are kept — never contact details.
-fn redacted_payload(
-    event: &str,
-    created_at: Option<i64>,
-    p: Option<&RzpPayment>,
-    r: Option<&RzpRefund>,
-    order_entity: Option<&Value>,
-) -> Value {
-    json!({
-        "event": event,
-        "createdAt": created_at,
-        "payment": p.map(|p| json!({
-            "id": p.id, "orderId": p.order_id, "amount": p.amount, "currency": p.currency,
-            "status": p.status, "method": p.method, "errorCode": p.error_code, "errorReason": p.error_reason,
-        })),
-        "refund": r.map(|r| json!({ "id": r.id, "paymentId": r.payment_id, "amount": r.amount, "status": r.status })),
-        "order": order_entity.map(|o| json!({ "id": o.get("id"), "amount": o.get("amount"), "status": o.get("status") })),
-    })
+/// A short, log/DB-safe token from a webhook field (ids, statuses, codes).
+fn token(v: Option<&Value>) -> Option<String> {
+    let s = match v? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let s: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '+'))
+        .take(64)
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
+
+fn number(v: Option<&Value>) -> Option<f64> {
+    v.and_then(Value::as_f64).filter(|x| x.is_finite())
+}
+
+/// What a payment/refund webhook says (a hint only; state is re-read).
+struct WebhookFacts<'a> {
+    order: Option<&'a Value>,
+    payment: Option<&'a Value>,
+    refund: Option<&'a Value>,
+    gateway_order_id: Option<String>,
+    payment_id: Option<String>,
+}
+
+impl<'a> WebhookFacts<'a> {
+    fn from(data: &'a Value) -> Self {
+        let order = data.get("order").filter(|v| v.is_object());
+        let payment = data.get("payment").filter(|v| v.is_object());
+        let refund = data
+            .get("refund")
+            .or_else(|| data.get("auto_refund"))
+            .filter(|v| v.is_object());
+        let gateway_order_id = order
+            .and_then(|o| o.get("order_id"))
+            .or_else(|| refund.and_then(|r| r.get("order_id")))
+            .and_then(Value::as_str)
+            .filter(|s| signature::is_gateway_order_id(s))
+            .map(str::to_owned);
+        let payment_id = token(payment.and_then(|p| p.get("cf_payment_id")))
+            .or_else(|| token(refund.and_then(|r| r.get("cf_payment_id"))))
+            .filter(|s| signature::is_gateway_payment_id(s));
+        WebhookFacts {
+            order,
+            payment,
+            refund,
+            gateway_order_id,
+            payment_id,
+        }
+    }
+
+    fn error_code(&self) -> Option<String> {
+        token(
+            self.payment
+                .and_then(|p| p.get("error_details"))
+                .and_then(|e| e.get("error_code")),
+        )
+    }
+
+    /// Only ids, amounts, statuses and codes are kept — never contact details,
+    /// UPI ids, card data or free-text messages.
+    fn redacted(&self, kind: &str, event_time: Option<String>) -> Value {
+        let o = self.order;
+        let p = self.payment;
+        let r = self.refund;
+        json!({
+            "type": kind,
+            "eventTime": event_time,
+            "order": o.map(|o| json!({
+                "orderId": token(o.get("order_id")),
+                "amount": number(o.get("order_amount")),
+                "currency": token(o.get("order_currency")),
+            })),
+            "payment": p.map(|p| json!({
+                "cfPaymentId": token(p.get("cf_payment_id")),
+                "status": token(p.get("payment_status")),
+                "amount": number(p.get("payment_amount")),
+                "currency": token(p.get("payment_currency")),
+                "group": token(p.get("payment_group")),
+                "errorCode": self.error_code(),
+            })),
+            "refund": r.map(|r| json!({
+                "cfRefundId": token(r.get("cf_refund_id")),
+                "refundId": token(r.get("refund_id")),
+                "cfPaymentId": token(r.get("cf_payment_id")),
+                "amount": number(r.get("refund_amount")),
+                "status": token(r.get("refund_status")),
+                "refundType": token(r.get("refund_type")),
+            })),
+        })
+    }
 }
 
 /// Handle a webhook whose signature has ALREADY been verified by the caller.
 ///
-/// Errors are transient (database / Razorpay unavailable): the event row stays
-/// unprocessed and the caller answers 5xx so Razorpay redelivers.
+/// Errors are transient (database / Cashfree unavailable, or a success that
+/// the API does not show yet): the event row stays unprocessed and the caller
+/// answers 5xx so Cashfree redelivers.
 pub async fn handle_webhook(
     state: &AppState,
     event_id: &str,
@@ -652,81 +905,39 @@ pub async fn handle_webhook(
 ) -> Result<WebhookResult, AppError> {
     let parsed: Value = serde_json::from_slice(body)
         .map_err(|_| AppError::Validation("webhook body is not valid JSON"))?;
-    let event = parsed
-        .get("event")
+    let kind = parsed
+        .get("type")
         .and_then(Value::as_str)
-        .filter(|e| (1..=100).contains(&e.len()))
-        .ok_or(AppError::Validation("webhook event is missing"))?
-        .to_owned();
-    let created_at = parsed.get("created_at").and_then(Value::as_i64);
-    let empty = Value::Null;
-    let payload = parsed.get("payload").unwrap_or(&empty);
-
-    let payment: Option<RzpPayment> = entity(payload, "payment");
-    let refund: Option<RzpRefund> = entity(payload, "refund");
-    let order_entity = payload.get("order").and_then(|o| o.get("entity"));
-
-    let rzp_order_id = payment
-        .as_ref()
-        .and_then(|p| p.order_id.clone())
-        .or_else(|| {
-            order_entity
-                .and_then(|o| o.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+        .filter(|e| {
+            (1..=100).contains(&e.len())
+                && e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
-        .filter(|s| signature::is_order_id(s));
-    let payment_id = payment
-        .as_ref()
-        .map(|p| p.id.clone())
-        .or_else(|| refund.as_ref().map(|r| r.payment_id.clone()))
-        .filter(|s| signature::is_payment_id(s));
+        .ok_or(AppError::Validation("webhook type is missing"))?
+        .to_owned();
+    let event_time = token(parsed.get("event_time"));
+    let empty = Value::Null;
+    let data = parsed.get("data").unwrap_or(&empty);
+    let facts = WebhookFacts::from(data);
 
-    let mut order_id = match &rzp_order_id {
-        Some(o) => repo::payments::order_id_by_razorpay_order(&state.db, o).await?,
+    let order_id = match &facts.gateway_order_id {
+        Some(g) => repo::payments::order_id_by_gateway_order(&state.db, g).await?,
         None => None,
     };
-    if order_id.is_none() {
-        if let Some(r) = refund.as_ref().filter(|r| signature::is_refund_id(&r.id)) {
-            order_id = repo::payments::find_refund_by_razorpay_id(&state.db, &r.id)
-                .await?
-                .map(|row| row.order_id);
-        }
-    }
-    if order_id.is_none() {
-        if let Some(p) = &payment_id {
-            order_id = repo::payments::order_id_by_razorpay_payment(&state.db, p).await?;
-        }
-    }
 
     let new_event = NewEvent {
         id: event_id,
-        event: &event,
+        event: &kind,
         order_id,
-        razorpay_order_id: rzp_order_id.as_deref(),
-        razorpay_payment_id: payment_id.as_deref(),
-        payload: redacted_payload(
-            &event,
-            created_at,
-            payment.as_ref(),
-            refund.as_ref(),
-            order_entity,
-        ),
+        gateway_order_id: facts.gateway_order_id.as_deref(),
+        gateway_payment_id: facts.payment_id.as_deref(),
+        payload: facts.redacted(&kind, event_time),
     };
     if repo::payments::record_event(&state.db, &new_event).await? {
-        tracing::debug!(event = %event, "duplicate webhook delivery acknowledged");
+        tracing::debug!(event = %kind, "duplicate webhook delivery acknowledged");
         return Ok(WebhookResult::Duplicate);
     }
 
-    let processed = process_event(
-        state,
-        &event,
-        payment,
-        refund,
-        rzp_order_id.as_deref(),
-        order_id,
-    )
-    .await;
+    let processed = process_event(state, &kind, &facts, order_id).await;
     match processed {
         Ok((outcome, resolved_order)) => {
             repo::payments::finish_event(
@@ -737,114 +948,150 @@ pub async fn handle_webhook(
                 resolved_order.or(order_id),
             )
             .await?;
-            tracing::info!(event = %event, outcome = %outcome, "webhook processed");
+            tracing::info!(event = %kind, outcome = %outcome, "webhook processed");
             Ok(WebhookResult::Processed(outcome))
         }
-        Err(e) => {
-            let label = match &e {
-                AppError::PaymentGateway => "error: payment gateway unavailable",
-                _ => "error: processing failed",
-            };
+        Err((label, e)) => {
             if let Err(db) =
                 repo::payments::finish_event(&state.db, event_id, label, false, order_id).await
             {
                 tracing::error!(error = %db, "could not record webhook failure");
             }
-            tracing::warn!(event = %event, "webhook processing failed; Razorpay will redeliver");
+            tracing::warn!(event = %kind, reason = label, "webhook processing failed; Cashfree will redeliver");
             Err(e)
         }
     }
 }
 
+type Processed = Result<(String, Option<Uuid>), (&'static str, AppError)>;
+
+fn gateway_down() -> (&'static str, AppError) {
+    (
+        "error: payment gateway unavailable",
+        AppError::PaymentGateway,
+    )
+}
+
 /// Returns `(outcome, order id)`; `Err` only for transient failures.
 async fn process_event(
     state: &AppState,
-    event: &str,
-    payment: Option<RzpPayment>,
-    refund: Option<RzpRefund>,
-    rzp_order_id: Option<&str>,
+    kind: &str,
+    facts: &WebhookFacts<'_>,
     order_id: Option<Uuid>,
-) -> Result<(String, Option<Uuid>), AppError> {
-    match event {
-        "payment.captured" | "payment.authorized" | "order.paid" => {
-            let (Some(p), Some(oid)) = (payment, rzp_order_id) else {
-                return Ok(("ignored: payload without payment/order".into(), order_id));
-            };
-            if order_id.is_none() {
+) -> Processed {
+    let db_err = |e: sqlx::Error| ("error: processing failed", AppError::from(e));
+    match kind {
+        "PAYMENT_SUCCESS_WEBHOOK" => {
+            let Some(oid) = order_id else {
                 return Ok(("ignored: unknown order".into(), None));
-            }
-            let pid = p.id.clone();
-            match settle_payment(state, oid, &pid, Source::Webhook(Box::new(p))).await {
+            };
+            match settle_order(state, oid, Source::Webhook).await {
+                // The webhook says SUCCESS but the API does not show it (yet):
+                // let Cashfree redeliver rather than drop the trigger.
+                Ok(s) if matches!(s.outcome, SettleOutcome::Pending | SettleOutcome::NotPaid) => {
+                    Err((
+                        "error: success not yet visible at the gateway",
+                        AppError::PaymentGateway,
+                    ))
+                }
                 Ok(s) => Ok((s.outcome.as_str().to_owned(), Some(s.order_id))),
                 Err(SettleError::UnknownOrder) => Ok(("ignored: unknown order".into(), order_id)),
                 Err(SettleError::Mismatch(why)) => Ok((format!("rejected: {why}"), order_id)),
-                Err(SettleError::Gateway(_)) => Err(AppError::PaymentGateway),
-                Err(SettleError::Db(e)) => Err(e.into()),
+                Err(SettleError::Gateway(GatewayError::Rejected { status, .. })) => {
+                    Ok((format!("rejected: gateway answered {status}"), order_id))
+                }
+                Err(SettleError::Gateway(GatewayError::Unavailable)) => Err(gateway_down()),
+                Err(SettleError::Db(e)) => Err(db_err(e)),
             }
         }
-        "payment.failed" => {
-            // The order stays `pending_payment`: the customer may retry until expiry.
-            let code = payment
-                .as_ref()
-                .and_then(|p| p.error_code.as_deref())
-                .map(|c| {
-                    c.chars()
-                        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                        .take(60)
-                        .collect::<String>()
-                })
-                .unwrap_or_else(|| "unknown".into());
+        // The order stays `pending_payment`: the customer may retry until expiry.
+        "PAYMENT_FAILED_WEBHOOK" => {
+            let code = facts.error_code().unwrap_or_else(|| "unknown".into());
             Ok((format!("payment_failed: {code}"), order_id))
         }
-        "refund.processed" | "refund.failed" | "refund.created" => match refund {
-            Some(r) => apply_refund_event(state, event, r)
-                .await
-                .map_err(AppError::from),
-            None => Ok(("ignored: payload without refund".into(), order_id)),
-        },
+        "PAYMENT_USER_DROPPED_WEBHOOK" => Ok(("payment_user_dropped".into(), order_id)),
+        "REFUND_STATUS_WEBHOOK" | "AUTO_REFUND_STATUS_WEBHOOK" => {
+            let (Some(oid), Some(gid), Some(hint)) =
+                (order_id, facts.gateway_order_id.as_deref(), facts.refund)
+            else {
+                return Ok(("ignored: unknown refund".into(), order_id));
+            };
+            let cf_refund_id = token(hint.get("cf_refund_id"));
+            let refund_id = hint
+                .get("refund_id")
+                .and_then(Value::as_str)
+                .filter(|s| signature::is_gateway_id(s));
+            // Authoritative state: by our/Cashfree's refund_id, else from the list.
+            let mut found = None;
+            if let Some(rid) = refund_id {
+                match state.cashfree.fetch_refund(gid, rid).await {
+                    Ok(r) => found = Some(r),
+                    Err(e) if e.is_not_found() => {}
+                    Err(GatewayError::Unavailable) => return Err(gateway_down()),
+                    Err(_) => {}
+                }
+            }
+            if found.is_none() {
+                match state.cashfree.fetch_order_refunds(gid).await {
+                    Ok(list) => {
+                        found = list.into_iter().find(|r| {
+                            Some(r.cf_refund_id.as_str()) == cf_refund_id.as_deref()
+                                || (refund_id.is_some() && r.refund_id.as_deref() == refund_id)
+                        });
+                    }
+                    Err(GatewayError::Unavailable) => return Err(gateway_down()),
+                    Err(_) => {}
+                }
+            }
+            match found {
+                Some(r) => apply_refund_event(state, oid, gid, r).await.map_err(db_err),
+                None => Ok(("ignored: refund not found at the gateway".into(), Some(oid))),
+            }
+        }
         _ => Ok(("ignored: unhandled event".into(), order_id)),
     }
 }
 
-/// Apply a `refund.*` webhook to the ledger and the order totals.
+/// Apply an (API-confirmed) Cashfree refund to the ledger and the order totals.
 async fn apply_refund_event(
     state: &AppState,
-    event: &str,
-    r: RzpRefund,
+    order_id: Uuid,
+    gateway_order_id: &str,
+    r: CfRefund,
 ) -> Result<(String, Option<Uuid>), sqlx::Error> {
-    if !signature::is_refund_id(&r.id) || !signature::is_payment_id(&r.payment_id) || r.amount <= 0
+    let amount = match r.amount_paise() {
+        Some(a) if a > 0 => a,
+        _ => return Ok(("rejected: malformed refund".into(), Some(order_id))),
+    };
+    if !signature::is_gateway_refund_id(&r.cf_refund_id)
+        || r.order_id.as_deref().is_some_and(|o| o != gateway_order_id)
     {
-        return Ok(("rejected: malformed refund".into(), None));
+        return Ok(("rejected: malformed refund".into(), Some(order_id)));
     }
-    let status = match event {
-        "refund.processed" => REFUND_PROCESSED,
-        "refund.failed" => REFUND_FAILED,
-        _ => refund_status(&r.status),
-    };
+    let status = refund_status(&r.refund_status);
 
-    // Locate our ledger row: by Razorpay id, else by our id (receipt/notes).
-    let mut row = repo::payments::find_refund_by_razorpay_id(&state.db, &r.id).await?;
-    if row.is_none() {
-        if let Some(ours) = r.our_refund_id() {
-            row = repo::payments::find_refund(&state.db, ours)
-                .await?
-                .filter(|x| x.razorpay_payment_id == r.payment_id && x.amount_paise == r.amount);
-        }
+    // Locate our ledger row: by Cashfree id, else by our id (refund_id).
+    let mut row = repo::payments::find_refund_by_gateway_id(&state.db, &r.cf_refund_id).await?;
+    if row.is_none()
+        && let Some(ours) = r.our_refund_id()
+    {
+        row = repo::payments::find_refund(&state.db, ours)
+            .await?
+            .filter(|x| x.order_id == order_id && x.amount_paise == amount);
     }
-    let order_id = match &row {
-        Some(x) => Some(x.order_id),
-        None => repo::payments::order_id_by_razorpay_payment(&state.db, &r.payment_id).await?,
-    };
-    let Some(order_id) = order_id else {
-        return Ok(("ignored: unknown refund".into(), None));
-    };
+    if row.as_ref().is_some_and(|x| x.order_id != order_id) {
+        return Ok((
+            "ignored: refund belongs to another order".into(),
+            Some(order_id),
+        ));
+    }
 
     let mut tx = state.db.begin().await?;
     repo::admins::set_lock_timeout(&mut tx).await?;
     let Some(order) = repo::orders::find_for_update(&mut tx, &OrderRef::Id(order_id)).await? else {
         return Ok(("ignored: unknown order".into(), None));
     };
-    let failure = (status == REFUND_FAILED).then_some("Razorpay reported the refund as failed");
+    let failure = (status == REFUND_FAILED).then_some("Cashfree reported the refund as failed");
     match &row {
         Some(x) => {
             // Re-read under the order lock: a processed refund never regresses.
@@ -853,34 +1100,58 @@ async fn apply_refund_event(
                 tx.rollback().await?;
                 return Ok(("ignored: refund already processed".into(), Some(order_id)));
             }
-            if !repo::payments::apply_refund_status(&mut tx, x.id, &r.id, status, failure).await? {
+            if !repo::payments::apply_refund_status(&mut tx, x.id, &r.cf_refund_id, status, failure)
+                .await?
+            {
                 tx.rollback().await?;
                 return Ok(("ignored: refund id conflict".into(), Some(order_id)));
             }
         }
         None => {
-            // Refund issued outside this system (Razorpay Dashboard).
+            // Issued outside this system: Cashfree Merchant Dashboard, or one of
+            // Cashfree's automatic refunds (e.g. a duplicate payment).
+            let payment_id = r
+                .cf_payment_id
+                .clone()
+                .filter(|p| signature::is_gateway_payment_id(p))
+                .or_else(|| order.gateway_payment_id.clone());
+            let Some(payment_id) = payment_id else {
+                tx.rollback().await?;
+                return Ok(("ignored: refund without payment".into(), Some(order_id)));
+            };
+            let automatic = r
+                .refund_type
+                .as_deref()
+                .is_some_and(|t| t.contains("AUTO_REFUND"));
+            let reason = if automatic {
+                "Automatic refund by Cashfree"
+            } else {
+                "Refund issued from the Cashfree Merchant Dashboard"
+            };
             repo::payments::insert_external_refund(
                 &mut tx,
                 order_id,
-                &r.payment_id,
-                &r.id,
-                r.amount,
+                &payment_id,
+                &r.cf_refund_id,
+                amount,
                 status,
-                "Refund issued from the Razorpay Dashboard",
+                reason,
             )
             .await?;
         }
     }
     if status == REFUND_FAILED {
-        let note = format!("Refund {} failed at Razorpay; retry the refund", r.id);
+        let note = format!(
+            "Refund {} failed at Cashfree; retry the refund",
+            r.cf_refund_id
+        );
         repo::payments::set_attention(&mut *tx, order_id, &note).await?;
     }
     if !repo::payments::sync_refund_totals(&mut tx, order_id).await? {
         repo::payments::bump_version(&mut *tx, order_id).await?;
     }
     tx.commit().await?;
-    tracing::info!(order_number = %order.order_number, razorpay_refund_id = %r.id, status, "refund webhook applied");
+    tracing::info!(order_number = %order.order_number, cf_refund_id = %r.cf_refund_id, status, "refund webhook applied");
     Ok((format!("refund_{status}"), Some(order_id)))
 }
 
@@ -895,9 +1166,73 @@ impl From<SettleError> for AppError {
     fn from(e: SettleError) -> Self {
         match e {
             SettleError::UnknownOrder => AppError::NotFound,
-            SettleError::Mismatch(_) => AppError::Validation("payment could not be verified"),
+            SettleError::Mismatch(_) => AppError::PaymentGateway,
             SettleError::Gateway(_) => AppError::PaymentGateway,
             SettleError::Db(e) => e.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refund_status_map() {
+        assert_eq!(refund_status("SUCCESS"), REFUND_PROCESSED);
+        assert_eq!(refund_status("CANCELLED"), REFUND_FAILED);
+        assert_eq!(refund_status("FAILED"), REFUND_FAILED);
+        assert_eq!(refund_status("REJECTED"), REFUND_FAILED);
+        for s in ["PENDING", "ONHOLD", "PENDING_APPROVAL", "whatever"] {
+            assert_eq!(refund_status(s), REFUND_PENDING, "{s}");
+        }
+    }
+
+    #[test]
+    fn event_id_is_stable_and_bounded() {
+        let a = event_id(b"{}");
+        assert_eq!(a, event_id(b"{}"));
+        assert_ne!(a, event_id(b"{ }"));
+        assert!(a.starts_with("cf_") && a.len() == 67);
+    }
+
+    #[test]
+    fn webhook_tokens_are_sanitised() {
+        assert_eq!(token(Some(&json!("SUCCESS"))).as_deref(), Some("SUCCESS"));
+        assert_eq!(token(Some(&json!(12376123))).as_deref(), Some("12376123"));
+        assert_eq!(token(Some(&json!("a b<c>@d"))).as_deref(), Some("abcd"));
+        assert_eq!(token(Some(&json!({ "x": 1 }))), None);
+        assert_eq!(token(Some(&json!(""))), None);
+    }
+
+    #[test]
+    fn payment_checks() {
+        let p = |amount: f64, currency: &str, order: Option<&str>| CfPayment {
+            cf_payment_id: "5114910253538".into(),
+            order_id: order.map(str::to_owned),
+            payment_status: "SUCCESS".into(),
+            payment_amount: amount,
+            payment_currency: currency.into(),
+            payment_group: Some("upi".into()),
+            error_details: None,
+        };
+        let gid = "ZM-261020-1001_8f3a2b1c9d0e";
+        let ok = check_payment(&p(1650.0, "INR", Some(gid)), gid, 165_000);
+        assert_eq!(
+            ok.as_ref().map(|c| c.instrument.clone()),
+            Ok(Some("upi".into()))
+        );
+        assert_eq!(
+            check_payment(&p(1649.99, "INR", Some(gid)), gid, 165_000).err(),
+            Some("amount mismatch")
+        );
+        assert_eq!(
+            check_payment(&p(1650.0, "USD", Some(gid)), gid, 165_000).err(),
+            Some("currency mismatch")
+        );
+        assert_eq!(
+            check_payment(&p(1650.0, "INR", Some("ZM-1_other")), gid, 165_000).err(),
+            Some("order id mismatch")
+        );
     }
 }
